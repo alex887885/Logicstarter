@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: hsl(222 47% 7%);
+  --color-foreground: hsl(210 20% 96%);
+  --color-card: hsl(222 47% 11%);
+  --color-card-foreground: hsl(210 20% 96%);
+  --color-popover: hsl(222 40% 11%);
+  --color-popover-foreground: hsl(210 20% 96%);
+  --color-primary: hsl(151 55% 42%);
+  --color-primary-foreground: hsl(160 84% 10%);
+  --color-secondary: hsl(222 34% 14%);
+  --color-secondary-foreground: hsl(210 20% 96%);
+  --color-muted: hsl(223 28% 15%);
+  --color-muted-foreground: hsl(215 16% 65%);
+  --color-accent: hsl(223 28% 15%);
+  --color-accent-foreground: hsl(210 20% 96%);
+  --color-border: hsl(217 32% 20%);
+  --color-input: hsl(217 32% 20%);
+  --color-ring: hsl(151 55% 42%);
+  --radius: 0.75rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --app-background: linear-gradient(180deg, #020617 0%, #0b1220 100%);
+  --app-surface: rgba(15, 23, 42, 0.82);
+  --app-page: rgba(11, 18, 32, 0.9);
+  --app-subtle: rgba(15, 23, 42, 0.72);
+}
+
+@layer base {
+  *, *::before, *::after {
+    box-sizing: border-box;
+    border-color: var(--color-border);
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    background: var(--app-background);
+    color: var(--color-foreground);
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    border: 1px solid rgba(30, 41, 59, 0.9);
+    background: var(--app-surface);
+    box-shadow: 0 10px 30px rgba(2, 6, 23, 0.28);
+  }
+
+  .glass-page {
+    border: 1px solid rgba(30, 41, 59, 0.9);
+    background: var(--app-page);
+    box-shadow: 0 12px 32px rgba(2, 6, 23, 0.24);
+  }
+
+  .glass-subtle {
+    border: 1px solid rgba(51, 65, 85, 0.85);
+    background: var(--app-subtle);
+  }
+}

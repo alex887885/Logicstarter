@@ -1,0 +1,7 @@
+'use strict';
+
+function createR2Config(config) {
+  return config;
+}
+
+exports.createR2Config = createR2Config;

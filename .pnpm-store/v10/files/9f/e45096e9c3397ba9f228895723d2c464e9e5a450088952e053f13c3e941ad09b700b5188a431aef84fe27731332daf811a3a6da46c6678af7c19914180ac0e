@@ -1,0 +1,18 @@
+import * as better_auth_db from 'better-auth/db';
+import { CloudflarePluginOptions } from './types.cjs';
+import '@cloudflare/workers-types';
+import 'better-auth';
+import 'better-auth/adapters/drizzle';
+import 'drizzle-orm/d1';
+import 'drizzle-orm/mysql2';
+import 'drizzle-orm/postgres-js';
+
+/**
+ * Generates database schema for Cloudflare plugin
+ *
+ * @param options - Plugin configuration
+ * @returns Schema with geolocation fields and file tracking
+ */
+declare const schema: (options: CloudflarePluginOptions) => better_auth_db.BetterAuthPluginDBSchema;
+
+export { schema };

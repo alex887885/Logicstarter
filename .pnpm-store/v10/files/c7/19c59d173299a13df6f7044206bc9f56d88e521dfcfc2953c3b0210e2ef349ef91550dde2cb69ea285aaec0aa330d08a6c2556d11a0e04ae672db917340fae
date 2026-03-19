@@ -1,0 +1,2 @@
+import { i as TranslationDictionary, n as I18nOptions, r as LocaleDetectionStrategy, t as i18n } from "./index-CLmzQKXC.mjs";
+export { I18nOptions, LocaleDetectionStrategy, TranslationDictionary, i18n };

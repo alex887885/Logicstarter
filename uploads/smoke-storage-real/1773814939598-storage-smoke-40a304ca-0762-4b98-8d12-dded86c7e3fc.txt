@@ -1,0 +1,1 @@
+logicstarter authenticated storage smoke

@@ -1,0 +1,112 @@
+import * as better_call0 from "better-call";
+import { BetterAuthPluginRegistry, BetterAuthPluginRegistryIdentifier, GenericEndpointContext, UnionToIntersection } from "@better-auth/core";
+
+//#region src/types.d.ts
+type ALL_PLUGIN_ERROR_CODE_KEYS = keyof UnionToIntersection<{ [Key in Exclude<BetterAuthPluginRegistryIdentifier, "i18n">]: BetterAuthPluginRegistry<unknown, unknown>[Key] extends {
+  creator: infer C;
+} ? C extends ((...args: any[]) => infer P) ? P extends {
+  $ERROR_CODES: infer E;
+} ? E : {} : {} : {} }[Exclude<BetterAuthPluginRegistryIdentifier, "i18n">]>;
+type InternalTranslationDictionary = Partial<{ [Key in ALL_PLUGIN_ERROR_CODE_KEYS]: string }>;
+/**
+ * Translation dictionary mapping error codes to translated messages
+ */
+type TranslationDictionary = InternalTranslationDictionary & Record<string, string>;
+/**
+ * Locale detection strategy
+ */
+type LocaleDetectionStrategy = "header" | "cookie" | "session" | "callback";
+/**
+ * Options for the i18n plugin
+ */
+interface I18nOptions<Locales extends string[]> {
+  /**
+   * Translation dictionaries keyed by locale code
+   * @example
+   * {
+   *   en: { USER_NOT_FOUND: "User not found" },
+   *   fr: { USER_NOT_FOUND: "Utilisateur non trouvé" }
+   * }
+   */
+  translations: { [Locale in Locales[number]]: TranslationDictionary };
+  /**
+   * Default/fallback locale when detection fails
+   * @default "en"
+   */
+  defaultLocale?: Locales[number] | undefined;
+  /**
+   * Locale detection strategies in priority order
+   * @default ["header"]
+   */
+  detection?: LocaleDetectionStrategy[] | undefined;
+  /**
+   * Cookie name for locale detection (when "cookie" strategy is used)
+   * @default "locale"
+   */
+  localeCookie?: string | undefined;
+  /**
+   * User field name for stored locale preference (when "session" strategy is used)
+   * @default "locale"
+   */
+  userLocaleField?: string | undefined;
+  /**
+   * Custom locale detection function (when "callback" strategy is used).
+   * @example
+   * getLocale: (ctx) => {
+   *   return ctx.headers?.get("X-Custom-Locale") ?? null;
+   * }
+   */
+  getLocale?: undefined | ((ctx: GenericEndpointContext) => Promise<Locales[number] | null> | Locales[number] | null);
+}
+//#endregion
+//#region src/index.d.ts
+declare module "@better-auth/core" {
+  interface BetterAuthPluginRegistry<AuthOptions, Options> {
+    i18n: {
+      creator: typeof i18n;
+    };
+  }
+}
+/**
+ * i18n plugin for Better Auth
+ *
+ * Translates error messages based on detected locale.
+ *
+ * @example
+ * ```ts
+ * import { betterAuth } from "better-auth";
+ * import { i18n } from "@better-auth/i18n";
+ *
+ * export const auth = betterAuth({
+ *   plugins: [
+ *     i18n({
+ *       translations: {
+ *         en: { USER_NOT_FOUND: "User not found" },
+ *         fr: { USER_NOT_FOUND: "Utilisateur non trouvé" },
+ *       },
+ *       detection: ["header", "cookie"],
+ *     }),
+ *   ],
+ * });
+ * ```
+ */
+declare const i18n: <Locales extends string[]>(options: I18nOptions<Locales>) => {
+  id: "i18n";
+  hooks: {
+    after: {
+      matcher: () => true;
+      handler: (inputContext: better_call0.MiddlewareInputContext<better_call0.MiddlewareOptions>) => Promise<void>;
+    }[];
+  };
+  options: {
+    translations: { [Locale in Locales[number]]: TranslationDictionary };
+    defaultLocale: Locales[number];
+    detection: LocaleDetectionStrategy[];
+    localeCookie: string;
+    userLocaleField: string;
+    getLocale?: ((ctx: GenericEndpointContext) => Locales[number] | Promise<Locales[number] | null> | null) | undefined;
+  };
+};
+//#endregion
+export { TranslationDictionary as i, I18nOptions as n, LocaleDetectionStrategy as r, i18n as t };
+//# sourceMappingURL=index-CLmzQKXC.d.mts.map

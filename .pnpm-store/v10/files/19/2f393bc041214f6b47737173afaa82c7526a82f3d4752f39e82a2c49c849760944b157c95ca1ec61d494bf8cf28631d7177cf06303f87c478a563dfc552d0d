@@ -1,0 +1,165 @@
+import { drizzleAdapter } from 'better-auth/adapters/drizzle';
+import { createAuthEndpoint, getSessionFromCtx } from 'better-auth/api';
+import { schema } from './schema.mjs';
+import { createR2Endpoints, createR2Storage } from './r2.mjs';
+export { R2_ERROR_CODES, createFileMetadataSchema, createFileValidator, createUploadFileSchema, error, fileIdSchema, listFilesSchema, success } from './r2.mjs';
+export { cloudflareClient } from './client.mjs';
+export { createR2Config } from './types.mjs';
+import 'mime/lite';
+import 'zod';
+
+const cloudflare = (options) => {
+  const opts = options ?? {};
+  const geolocationTrackingEnabled = opts.geolocationTracking === void 0 || opts.geolocationTracking;
+  let r2Storage = null;
+  return {
+    id: "cloudflare",
+    schema: schema(opts),
+    endpoints: {
+      getGeolocation: createAuthEndpoint(
+        "/cloudflare/geolocation",
+        {
+          method: "GET"
+        },
+        async (ctx) => {
+          const session = await getSessionFromCtx(ctx);
+          if (!session) {
+            return ctx.json({ error: "Unauthorized" }, { status: 401 });
+          }
+          const cf = await Promise.resolve(opts.cf);
+          if (!cf) {
+            return ctx.json({ error: "Cloudflare context is not available" }, { status: 404 });
+          }
+          const context = extractGeolocationData(cf);
+          return ctx.json(context);
+        }
+      ),
+      ...opts.r2 ? createR2Endpoints(() => r2Storage, opts.r2) : {}
+    },
+    init(init_ctx) {
+      if (opts.r2) {
+        r2Storage = createR2Storage(opts.r2, init_ctx.generateId);
+      }
+      return {
+        options: {
+          databaseHooks: {
+            session: {
+              create: {
+                before: async (s) => {
+                  if (!geolocationTrackingEnabled) {
+                    return s;
+                  }
+                  const cf = await Promise.resolve(opts.cf);
+                  if (!cf) {
+                    return s;
+                  }
+                  const geoData = extractGeolocationData(cf);
+                  s.timezone = geoData.timezone;
+                  s.city = geoData.city;
+                  s.country = geoData.country;
+                  s.region = geoData.region;
+                  s.regionCode = geoData.regionCode;
+                  s.colo = geoData.colo;
+                  s.latitude = geoData.latitude;
+                  s.longitude = geoData.longitude;
+                  return s;
+                }
+              }
+            }
+          }
+        }
+      };
+    }
+  };
+};
+function extractGeolocationData(input) {
+  if (!input || typeof input !== "object") {
+    return {};
+  }
+  return {
+    timezone: input.timezone || void 0,
+    city: input.city || void 0,
+    country: input.country || void 0,
+    region: input.region || void 0,
+    regionCode: input.regionCode || void 0,
+    colo: input.colo || void 0,
+    latitude: input.latitude || void 0,
+    longitude: input.longitude || void 0
+  };
+}
+const createKVStorage = (kv) => {
+  return {
+    get: async (key) => {
+      return kv.get(key);
+    },
+    set: async (key, value, ttl) => {
+      if (ttl !== void 0) {
+        const minTtl = 60;
+        if (ttl < minTtl) {
+          console.warn(`[BetterAuthCloudflare] TTL ${ttl}s is less than KV minimum of ${minTtl}s. Using ${minTtl}s instead.`);
+          ttl = minTtl;
+        }
+        return kv.put(key, value, { expirationTtl: ttl });
+      }
+      return kv.put(key, value);
+    },
+    delete: async (key) => {
+      return kv.delete(key);
+    }
+  };
+};
+const withCloudflare = (cloudFlareOptions, options) => {
+  const autoDetectIpEnabled = cloudFlareOptions.autoDetectIpAddress === void 0 || cloudFlareOptions.autoDetectIpAddress === true;
+  const geolocationTrackingForSession = cloudFlareOptions.geolocationTracking === void 0 || cloudFlareOptions.geolocationTracking === true;
+  if (autoDetectIpEnabled || geolocationTrackingForSession) {
+    if (!cloudFlareOptions.cf) {
+      throw new Error(
+        "Cloudflare context is required for geolocation or IP detection features. Be sure to pass the `cf` option to the withCloudflare function."
+      );
+    }
+  }
+  let updatedAdvanced = { ...options.advanced };
+  if (autoDetectIpEnabled) {
+    updatedAdvanced.ipAddress = {
+      ...updatedAdvanced.ipAddress ?? {},
+      ipAddressHeaders: ["cf-connecting-ip", "x-real-ip", ...updatedAdvanced.ipAddress?.ipAddressHeaders ?? []]
+    };
+  } else if (updatedAdvanced.ipAddress?.ipAddressHeaders) ;
+  let updatedSession = { ...options.session };
+  if (geolocationTrackingForSession) {
+    updatedSession.storeSessionInDatabase = true;
+  } else if (options.session?.storeSessionInDatabase === void 0) ;
+  const dbConfigs = [cloudFlareOptions.postgres, cloudFlareOptions.mysql, cloudFlareOptions.d1].filter(Boolean);
+  if (dbConfigs.length > 1) {
+    throw new Error(
+      "Only one database configuration can be provided. Please provide only one of postgres, mysql, or d1."
+    );
+  }
+  let database;
+  if (cloudFlareOptions.postgres) {
+    database = drizzleAdapter(cloudFlareOptions.postgres.db, {
+      provider: "pg",
+      ...cloudFlareOptions.postgres.options
+    });
+  } else if (cloudFlareOptions.mysql) {
+    database = drizzleAdapter(cloudFlareOptions.mysql.db, {
+      provider: "mysql",
+      ...cloudFlareOptions.mysql.options
+    });
+  } else if (cloudFlareOptions.d1) {
+    database = drizzleAdapter(cloudFlareOptions.d1.db, {
+      provider: "sqlite",
+      ...cloudFlareOptions.d1.options
+    });
+  }
+  return {
+    ...options,
+    database,
+    secondaryStorage: cloudFlareOptions.kv ? createKVStorage(cloudFlareOptions.kv) : void 0,
+    plugins: [cloudflare(cloudFlareOptions), ...options.plugins ?? []],
+    advanced: updatedAdvanced,
+    session: updatedSession
+  };
+};
+
+export { cloudflare, createKVStorage, createR2Endpoints, createR2Storage, schema, withCloudflare };

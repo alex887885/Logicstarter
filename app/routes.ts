@@ -1,0 +1,26 @@
+import { index, route } from "@react-router/dev/routes";
+
+export default [
+  index("routes/_index.tsx"),
+  route("api/auth/runtime", "routes/api.auth.runtime.tsx"),
+  route("api/billing/checkout", "routes/api.billing.checkout.tsx"),
+  route("api/billing/portal", "routes/api.billing.portal.tsx"),
+  route("api/billing/runtime", "routes/api.billing.runtime.tsx"),
+  route("api/billing/state", "routes/api.billing.state.tsx"),
+  route("api/billing/sync", "routes/api.billing.sync.tsx"),
+  route("api/billing/webhook", "routes/api.billing.webhook.tsx"),
+  route("api/check-email", "routes/api.check-email.ts"),
+  route("api/email/runtime", "routes/api.email.runtime.tsx"),
+  route("api/providers/runtime", "routes/api.providers.runtime.tsx"),
+  route("api/register", "routes/api.register.ts"),
+  route("api/auth/methods", "routes/api.auth.methods.tsx"),
+  route("api/sms/runtime", "routes/api.sms.runtime.tsx"),
+  route("api/auth/*", "routes/api.auth.$.tsx"),
+  route("api/storage/delete", "routes/api.storage.delete.tsx"),
+  route("api/storage/runtime", "routes/api.storage.runtime.tsx"),
+  route("api/storage/signed-url", "routes/api.storage.signed-url.tsx"),
+  route("api/storage/upload", "routes/api.storage.upload.tsx"),
+  route("api/settings/providers", "routes/api.settings.providers.tsx"),
+  route("settings/providers", "routes/settings.providers.tsx"),
+  route("uploads/*", "routes/uploads.$.tsx"),
+] as const;

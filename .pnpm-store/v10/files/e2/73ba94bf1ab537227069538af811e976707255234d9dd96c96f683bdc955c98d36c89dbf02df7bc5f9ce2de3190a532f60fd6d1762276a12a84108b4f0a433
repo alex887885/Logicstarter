@@ -1,0 +1,1796 @@
+import { t as STRIPE_ERROR_CODES } from "./error-codes-CCosYkXx.mjs";
+import { APIError, HIDE_METADATA } from "better-auth";
+import { defu } from "defu";
+import { createAuthEndpoint, createAuthMiddleware } from "@better-auth/core/api";
+import { APIError as APIError$1 } from "@better-auth/core/error";
+import { getSessionFromCtx, originCheck, sessionMiddleware } from "better-auth/api";
+import * as z from "zod/v4";
+import { mergeSchema } from "better-auth/db";
+
+//#region src/metadata.ts
+/**
+* Customer metadata - set internal fields and extract typed fields.
+*/
+const customerMetadata = {
+	keys: {
+		userId: "userId",
+		organizationId: "organizationId",
+		customerType: "customerType"
+	},
+	set(internalFields, ...userMetadata) {
+		return defu(internalFields, ...userMetadata.filter(Boolean));
+	},
+	get(metadata) {
+		return {
+			userId: metadata?.userId,
+			organizationId: metadata?.organizationId,
+			customerType: metadata?.customerType
+		};
+	}
+};
+/**
+* Subscription/Checkout metadata - set internal fields and extract typed fields.
+*/
+const subscriptionMetadata = {
+	keys: {
+		userId: "userId",
+		subscriptionId: "subscriptionId",
+		referenceId: "referenceId"
+	},
+	set(internalFields, ...userMetadata) {
+		return defu(internalFields, ...userMetadata.filter(Boolean));
+	},
+	get(metadata) {
+		return {
+			userId: metadata?.userId,
+			subscriptionId: metadata?.subscriptionId,
+			referenceId: metadata?.referenceId
+		};
+	}
+};
+
+//#endregion
+//#region src/utils.ts
+async function getPlans(subscriptionOptions) {
+	if (subscriptionOptions?.enabled) return typeof subscriptionOptions.plans === "function" ? await subscriptionOptions.plans() : subscriptionOptions.plans;
+	throw new Error("Subscriptions are not enabled in the Stripe options.");
+}
+async function getPlanByName(options, name) {
+	return await getPlans(options.subscription).then((res) => res?.find((plan) => plan.name.toLowerCase() === name.toLowerCase()));
+}
+/**
+* Checks if a subscription is in an available state (active or trialing)
+*/
+function isActiveOrTrialing(sub) {
+	return sub.status === "active" || sub.status === "trialing";
+}
+/**
+* Check if a subscription is scheduled to be canceled (DB subscription object)
+*/
+function isPendingCancel(sub) {
+	return !!(sub.cancelAtPeriodEnd || sub.cancelAt);
+}
+/**
+* Check if a Stripe subscription is scheduled to be canceled (Stripe API response)
+*/
+function isStripePendingCancel(stripeSub) {
+	return !!(stripeSub.cancel_at_period_end || stripeSub.cancel_at);
+}
+/**
+* Escapes a value for use in Stripe search queries.
+* Stripe search query uses double quotes for string values,
+* and double quotes within the value need to be escaped with backslash.
+*
+* @see https://docs.stripe.com/search#search-query-language
+*/
+function escapeStripeSearchValue(value) {
+	return value.replace(/"/g, "\\\"");
+}
+/**
+* Resolve the quantity for a subscription by checking the seat item first,
+* then falling back to the plan item's quantity.
+*/
+function resolveQuantity(items, planItem, seatPriceId) {
+	if (seatPriceId) {
+		const seatItem = items.find((item) => item.price.id === seatPriceId);
+		if (seatItem) return seatItem.quantity ?? 1;
+	}
+	return planItem.quantity ?? 1;
+}
+/**
+* Resolve the plan-matching subscription item and its plan config
+* from a (possibly multi-item) Stripe subscription.
+*
+* - Iterates items to find one whose price matches a configured plan.
+* - For single-item subscriptions, returns the item even without a plan match.
+*/
+async function resolvePlanItem(options, items) {
+	const first = items[0];
+	if (!first) return void 0;
+	const plans = await getPlans(options.subscription);
+	for (const item of items) {
+		const plan = plans?.find((p) => p.priceId === item.price.id || p.annualDiscountPriceId === item.price.id || item.price.lookup_key && (p.lookupKey === item.price.lookup_key || p.annualDiscountLookupKey === item.price.lookup_key));
+		if (plan) return {
+			item,
+			plan
+		};
+	}
+	return items.length === 1 ? {
+		item: first,
+		plan: void 0
+	} : void 0;
+}
+
+//#endregion
+//#region src/hooks.ts
+/**
+* Find organization or user by stripeCustomerId.
+* @internal
+*/
+async function findReferenceByStripeCustomerId(ctx, options, stripeCustomerId) {
+	if (options.organization?.enabled) {
+		const org = await ctx.context.adapter.findOne({
+			model: "organization",
+			where: [{
+				field: "stripeCustomerId",
+				value: stripeCustomerId
+			}]
+		});
+		if (org) return {
+			customerType: "organization",
+			referenceId: org.id
+		};
+	}
+	const user = await ctx.context.adapter.findOne({
+		model: "user",
+		where: [{
+			field: "stripeCustomerId",
+			value: stripeCustomerId
+		}]
+	});
+	if (user) return {
+		customerType: "user",
+		referenceId: user.id
+	};
+	return null;
+}
+async function onCheckoutSessionCompleted(ctx, options, event) {
+	try {
+		const client = options.stripeClient;
+		const checkoutSession = event.data.object;
+		if (checkoutSession.mode === "setup" || !options.subscription?.enabled) return;
+		const subscription = await client.subscriptions.retrieve(checkoutSession.subscription);
+		const resolved = await resolvePlanItem(options, subscription.items.data);
+		if (!resolved) {
+			ctx.context.logger.warn(`Stripe webhook warning: Subscription ${subscription.id} has no items matching a configured plan`);
+			return;
+		}
+		const { item: subscriptionItem, plan } = resolved;
+		if (plan) {
+			const checkoutMeta = subscriptionMetadata.get(checkoutSession?.metadata);
+			const referenceId = checkoutSession?.client_reference_id || checkoutMeta.referenceId;
+			const { subscriptionId } = checkoutMeta;
+			const seats = resolveQuantity(subscription.items.data, subscriptionItem, plan.seatPriceId);
+			if (referenceId && subscriptionId) {
+				const trial = subscription.trial_start && subscription.trial_end ? {
+					trialStart: /* @__PURE__ */ new Date(subscription.trial_start * 1e3),
+					trialEnd: /* @__PURE__ */ new Date(subscription.trial_end * 1e3)
+				} : {};
+				let dbSubscription = await ctx.context.adapter.update({
+					model: "subscription",
+					update: {
+						...trial,
+						plan: plan.name.toLowerCase(),
+						status: subscription.status,
+						updatedAt: /* @__PURE__ */ new Date(),
+						periodStart: /* @__PURE__ */ new Date(subscriptionItem.current_period_start * 1e3),
+						periodEnd: /* @__PURE__ */ new Date(subscriptionItem.current_period_end * 1e3),
+						stripeSubscriptionId: checkoutSession.subscription,
+						cancelAtPeriodEnd: subscription.cancel_at_period_end,
+						cancelAt: subscription.cancel_at ? /* @__PURE__ */ new Date(subscription.cancel_at * 1e3) : null,
+						canceledAt: subscription.canceled_at ? /* @__PURE__ */ new Date(subscription.canceled_at * 1e3) : null,
+						endedAt: subscription.ended_at ? /* @__PURE__ */ new Date(subscription.ended_at * 1e3) : null,
+						seats,
+						billingInterval: subscriptionItem.price.recurring?.interval
+					},
+					where: [{
+						field: "id",
+						value: subscriptionId
+					}]
+				});
+				if (trial.trialStart && plan.freeTrial?.onTrialStart) await plan.freeTrial.onTrialStart(dbSubscription);
+				if (!dbSubscription) dbSubscription = await ctx.context.adapter.findOne({
+					model: "subscription",
+					where: [{
+						field: "id",
+						value: subscriptionId
+					}]
+				});
+				await options.subscription?.onSubscriptionComplete?.({
+					event,
+					subscription: dbSubscription,
+					stripeSubscription: subscription,
+					plan
+				}, ctx);
+				return;
+			}
+		}
+	} catch (e) {
+		ctx.context.logger.error(`Stripe webhook failed. Error: ${e.message}`);
+	}
+}
+async function onSubscriptionCreated(ctx, options, event) {
+	try {
+		if (!options.subscription?.enabled) return;
+		const subscriptionCreated = event.data.object;
+		const stripeCustomerId = subscriptionCreated.customer?.toString();
+		if (!stripeCustomerId) {
+			ctx.context.logger.warn(`Stripe webhook warning: customer.subscription.created event received without customer ID`);
+			return;
+		}
+		const { subscriptionId } = subscriptionMetadata.get(subscriptionCreated.metadata);
+		const existingSubscription = await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: subscriptionId ? [{
+				field: "id",
+				value: subscriptionId
+			}] : [{
+				field: "stripeSubscriptionId",
+				value: subscriptionCreated.id
+			}]
+		});
+		if (existingSubscription) {
+			ctx.context.logger.info(`Stripe webhook: Subscription already exists in database (id: ${existingSubscription.id}), skipping creation`);
+			return;
+		}
+		const reference = await findReferenceByStripeCustomerId(ctx, options, stripeCustomerId);
+		if (!reference) {
+			ctx.context.logger.warn(`Stripe webhook warning: No user or organization found with stripeCustomerId: ${stripeCustomerId}`);
+			return;
+		}
+		const { referenceId, customerType } = reference;
+		const resolved = await resolvePlanItem(options, subscriptionCreated.items.data);
+		if (!resolved) {
+			ctx.context.logger.warn(`Stripe webhook warning: Subscription ${subscriptionCreated.id} has no items matching a configured plan`);
+			return;
+		}
+		const { item: subscriptionItem, plan } = resolved;
+		if (!plan) {
+			ctx.context.logger.warn(`Stripe webhook warning: No matching plan found for priceId: ${subscriptionItem.price.id}`);
+			return;
+		}
+		const seats = resolveQuantity(subscriptionCreated.items.data, subscriptionItem, plan.seatPriceId);
+		const periodStart = /* @__PURE__ */ new Date(subscriptionItem.current_period_start * 1e3);
+		const periodEnd = /* @__PURE__ */ new Date(subscriptionItem.current_period_end * 1e3);
+		const trial = subscriptionCreated.trial_start && subscriptionCreated.trial_end ? {
+			trialStart: /* @__PURE__ */ new Date(subscriptionCreated.trial_start * 1e3),
+			trialEnd: /* @__PURE__ */ new Date(subscriptionCreated.trial_end * 1e3)
+		} : {};
+		const newSubscription = await ctx.context.adapter.create({
+			model: "subscription",
+			data: {
+				...trial,
+				...plan.limits ? { limits: plan.limits } : {},
+				referenceId,
+				stripeCustomerId,
+				stripeSubscriptionId: subscriptionCreated.id,
+				status: subscriptionCreated.status,
+				plan: plan.name.toLowerCase(),
+				periodStart,
+				periodEnd,
+				seats,
+				billingInterval: subscriptionItem.price.recurring?.interval
+			}
+		});
+		ctx.context.logger.info(`Stripe webhook: Created subscription ${subscriptionCreated.id} for ${customerType} ${referenceId} from dashboard`);
+		await options.subscription.onSubscriptionCreated?.({
+			event,
+			subscription: newSubscription,
+			stripeSubscription: subscriptionCreated,
+			plan
+		});
+	} catch (error) {
+		ctx.context.logger.error(`Stripe webhook failed. Error: ${error}`);
+	}
+}
+async function onSubscriptionUpdated(ctx, options, event) {
+	try {
+		if (!options.subscription?.enabled) return;
+		const subscriptionUpdated = event.data.object;
+		const resolved = await resolvePlanItem(options, subscriptionUpdated.items.data);
+		if (!resolved) {
+			ctx.context.logger.warn(`Stripe webhook warning: Subscription ${subscriptionUpdated.id} has no items matching a configured plan`);
+			return;
+		}
+		const { item: subscriptionItem, plan } = resolved;
+		const { subscriptionId } = subscriptionMetadata.get(subscriptionUpdated.metadata);
+		const customerId = subscriptionUpdated.customer?.toString();
+		let subscription = await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: subscriptionId ? [{
+				field: "id",
+				value: subscriptionId
+			}] : [{
+				field: "stripeSubscriptionId",
+				value: subscriptionUpdated.id
+			}]
+		});
+		if (!subscription) {
+			const subs = await ctx.context.adapter.findMany({
+				model: "subscription",
+				where: [{
+					field: "stripeCustomerId",
+					value: customerId
+				}]
+			});
+			if (subs.length > 1) {
+				const activeSub = subs.find((sub) => isActiveOrTrialing(sub));
+				if (!activeSub) {
+					ctx.context.logger.warn(`Stripe webhook error: Multiple subscriptions found for customerId: ${customerId} and no active subscription is found`);
+					return;
+				}
+				subscription = activeSub;
+			} else subscription = subs[0];
+		}
+		const seats = plan ? resolveQuantity(subscriptionUpdated.items.data, subscriptionItem, plan.seatPriceId) : subscriptionItem.quantity;
+		const trial = subscriptionUpdated.trial_start && subscriptionUpdated.trial_end ? {
+			trialStart: /* @__PURE__ */ new Date(subscriptionUpdated.trial_start * 1e3),
+			trialEnd: /* @__PURE__ */ new Date(subscriptionUpdated.trial_end * 1e3)
+		} : {};
+		const updatedSubscription = await ctx.context.adapter.update({
+			model: "subscription",
+			update: {
+				...trial,
+				...plan ? {
+					plan: plan.name.toLowerCase(),
+					limits: plan.limits
+				} : {},
+				updatedAt: /* @__PURE__ */ new Date(),
+				status: subscriptionUpdated.status,
+				periodStart: /* @__PURE__ */ new Date(subscriptionItem.current_period_start * 1e3),
+				periodEnd: /* @__PURE__ */ new Date(subscriptionItem.current_period_end * 1e3),
+				cancelAtPeriodEnd: subscriptionUpdated.cancel_at_period_end,
+				cancelAt: subscriptionUpdated.cancel_at ? /* @__PURE__ */ new Date(subscriptionUpdated.cancel_at * 1e3) : null,
+				canceledAt: subscriptionUpdated.canceled_at ? /* @__PURE__ */ new Date(subscriptionUpdated.canceled_at * 1e3) : null,
+				endedAt: subscriptionUpdated.ended_at ? /* @__PURE__ */ new Date(subscriptionUpdated.ended_at * 1e3) : null,
+				seats,
+				stripeSubscriptionId: subscriptionUpdated.id,
+				billingInterval: subscriptionItem.price.recurring?.interval,
+				stripeScheduleId: subscriptionUpdated.schedule ? typeof subscriptionUpdated.schedule === "string" ? subscriptionUpdated.schedule : subscriptionUpdated.schedule.id : null
+			},
+			where: [{
+				field: "id",
+				value: subscription.id
+			}]
+		});
+		if (subscriptionUpdated.status === "active" && isStripePendingCancel(subscriptionUpdated) && !isPendingCancel(subscription)) await options.subscription.onSubscriptionCancel?.({
+			subscription,
+			cancellationDetails: subscriptionUpdated.cancellation_details || void 0,
+			stripeSubscription: subscriptionUpdated,
+			event
+		});
+		await options.subscription.onSubscriptionUpdate?.({
+			event,
+			subscription: updatedSubscription || subscription
+		});
+		if (plan) {
+			if (subscriptionUpdated.status === "active" && subscription.status === "trialing" && plan.freeTrial?.onTrialEnd) await plan.freeTrial.onTrialEnd({ subscription }, ctx);
+			if (subscriptionUpdated.status === "incomplete_expired" && subscription.status === "trialing" && plan.freeTrial?.onTrialExpired) await plan.freeTrial.onTrialExpired(subscription, ctx);
+		}
+	} catch (error) {
+		ctx.context.logger.error(`Stripe webhook failed. Error: ${error}`);
+	}
+}
+async function onSubscriptionDeleted(ctx, options, event) {
+	if (!options.subscription?.enabled) return;
+	try {
+		const subscriptionDeleted = event.data.object;
+		const subscriptionId = subscriptionDeleted.id;
+		const subscription = await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: [{
+				field: "stripeSubscriptionId",
+				value: subscriptionId
+			}]
+		});
+		if (subscription) {
+			const trial = subscriptionDeleted.trial_start && subscriptionDeleted.trial_end ? {
+				trialStart: /* @__PURE__ */ new Date(subscriptionDeleted.trial_start * 1e3),
+				trialEnd: /* @__PURE__ */ new Date(subscriptionDeleted.trial_end * 1e3)
+			} : {};
+			await ctx.context.adapter.update({
+				model: "subscription",
+				where: [{
+					field: "id",
+					value: subscription.id
+				}],
+				update: {
+					...trial,
+					status: "canceled",
+					updatedAt: /* @__PURE__ */ new Date(),
+					cancelAtPeriodEnd: subscriptionDeleted.cancel_at_period_end,
+					cancelAt: subscriptionDeleted.cancel_at ? /* @__PURE__ */ new Date(subscriptionDeleted.cancel_at * 1e3) : null,
+					canceledAt: subscriptionDeleted.canceled_at ? /* @__PURE__ */ new Date(subscriptionDeleted.canceled_at * 1e3) : null,
+					endedAt: subscriptionDeleted.ended_at ? /* @__PURE__ */ new Date(subscriptionDeleted.ended_at * 1e3) : null,
+					stripeScheduleId: null
+				}
+			});
+			await options.subscription.onSubscriptionDeleted?.({
+				event,
+				stripeSubscription: subscriptionDeleted,
+				subscription
+			});
+		} else ctx.context.logger.warn(`Stripe webhook error: Subscription not found for subscriptionId: ${subscriptionId}`);
+	} catch (error) {
+		ctx.context.logger.error(`Stripe webhook failed. Error: ${error}`);
+	}
+}
+
+//#endregion
+//#region src/middleware.ts
+const stripeSessionMiddleware = createAuthMiddleware({ use: [sessionMiddleware] }, async (ctx) => {
+	return { session: ctx.context.session };
+});
+const referenceMiddleware = (subscriptionOptions, action) => createAuthMiddleware(async (ctx) => {
+	const ctxSession = ctx.context.session;
+	if (!ctxSession) throw APIError$1.from("UNAUTHORIZED", STRIPE_ERROR_CODES.UNAUTHORIZED);
+	const customerType = ctx.body?.customerType || ctx.query?.customerType;
+	const explicitReferenceId = ctx.body?.referenceId || ctx.query?.referenceId;
+	if (customerType === "organization") {
+		if (!subscriptionOptions.authorizeReference) {
+			ctx.context.logger.error(`Organization subscriptions require authorizeReference to be defined in your stripe plugin config.`);
+			throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.AUTHORIZE_REFERENCE_REQUIRED);
+		}
+		const referenceId = explicitReferenceId || ctxSession.session.activeOrganizationId;
+		if (!referenceId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.ORGANIZATION_REFERENCE_ID_REQUIRED);
+		if (!await subscriptionOptions.authorizeReference({
+			user: ctxSession.user,
+			session: ctxSession.session,
+			referenceId,
+			action
+		}, ctx)) throw APIError$1.from("UNAUTHORIZED", STRIPE_ERROR_CODES.UNAUTHORIZED);
+		return;
+	}
+	if (!explicitReferenceId) return;
+	if (explicitReferenceId === ctxSession.user.id) return;
+	if (!subscriptionOptions.authorizeReference) {
+		ctx.context.logger.error(`Passing referenceId into a subscription action isn't allowed if subscription.authorizeReference isn't defined in your stripe plugin config.`);
+		throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.REFERENCE_ID_NOT_ALLOWED);
+	}
+	if (!await subscriptionOptions.authorizeReference({
+		user: ctxSession.user,
+		session: ctxSession.session,
+		referenceId: explicitReferenceId,
+		action
+	}, ctx)) throw APIError$1.from("UNAUTHORIZED", STRIPE_ERROR_CODES.UNAUTHORIZED);
+});
+
+//#endregion
+//#region src/routes.ts
+/**
+* Converts a relative URL to an absolute URL using baseURL.
+* @internal
+*/
+function getUrl(ctx, url) {
+	if (/^[a-zA-Z][a-zA-Z0-9+\-.]*:/.test(url)) return url;
+	return `${ctx.context.options.baseURL}${url.startsWith("/") ? url : `/${url}`}`;
+}
+/**
+* Resolves a Stripe price ID from a lookup key.
+* @internal
+*/
+async function resolvePriceIdFromLookupKey(stripeClient, lookupKey) {
+	if (!lookupKey) return void 0;
+	return (await stripeClient.prices.list({
+		lookup_keys: [lookupKey],
+		active: true,
+		limit: 1
+	})).data[0]?.id;
+}
+/**
+* Determines the reference ID based on customer type.
+* - `user` (default): uses userId
+* - `organization`: uses activeOrganizationId from session
+* @internal
+*/
+function getReferenceId(ctxSession, customerType, options) {
+	const { user, session } = ctxSession;
+	if ((customerType || "user") === "organization") {
+		if (!options.organization?.enabled) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.ORGANIZATION_SUBSCRIPTION_NOT_ENABLED);
+		if (!session.activeOrganizationId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.ORGANIZATION_NOT_FOUND);
+		return session.activeOrganizationId;
+	}
+	return user.id;
+}
+const upgradeSubscriptionBodySchema = z.object({
+	plan: z.string().meta({ description: "The name of the plan to upgrade to. Eg: \"pro\"" }),
+	annual: z.boolean().meta({ description: "Whether to upgrade to an annual plan. Eg: true" }).optional(),
+	referenceId: z.string().meta({ description: "Reference ID for the subscription. Eg: \"org_123\"" }).optional(),
+	subscriptionId: z.string().meta({ description: "The Stripe subscription ID to upgrade. Eg: \"sub_1ABC2DEF3GHI4JKL\"" }).optional(),
+	customerType: z.enum(["user", "organization"]).meta({ description: "Customer type for the subscription. Eg: \"user\" or \"organization\"" }).optional(),
+	metadata: z.record(z.string(), z.any()).optional(),
+	seats: z.number().meta({ description: "Number of seats to upgrade to (if applicable). Eg: 1" }).optional(),
+	locale: z.custom((localization) => {
+		return typeof localization === "string";
+	}).meta({ description: "The locale to display Checkout in. Eg: 'en', 'ko'. If not provided or set to `auto`, the browser's locale is used." }).optional(),
+	successUrl: z.string().meta({ description: "Callback URL to redirect back after successful subscription. Eg: \"https://example.com/success\"" }).default("/"),
+	cancelUrl: z.string().meta({ description: "If set, checkout shows a back button and customers will be directed here if they cancel payment. Eg: \"https://example.com/pricing\"" }).default("/"),
+	returnUrl: z.string().meta({ description: "URL to take customers to when they click on the billing portal’s link to return to your website. Eg: \"https://example.com/dashboard\"" }).optional(),
+	scheduleAtPeriodEnd: z.boolean().meta({ description: "Schedule the plan change at the end of the current billing period instead of applying immediately." }).default(false),
+	disableRedirect: z.boolean().meta({ description: "Disable redirect after successful subscription. Eg: true" }).default(false)
+});
+/**
+* ### Endpoint
+*
+* POST `/subscription/upgrade`
+*
+* ### API Methods
+*
+* **server:**
+* `auth.api.upgradeSubscription`
+*
+* **client:**
+* `authClient.subscription.upgrade`
+*
+* @see [Read our docs to learn more.](https://better-auth.com/docs/plugins/stripe#api-method-subscription-upgrade)
+*/
+const upgradeSubscription = (options) => {
+	const client = options.stripeClient;
+	const subscriptionOptions = options.subscription;
+	return createAuthEndpoint("/subscription/upgrade", {
+		method: "POST",
+		body: upgradeSubscriptionBodySchema,
+		metadata: { openapi: { operationId: "upgradeSubscription" } },
+		use: [
+			stripeSessionMiddleware,
+			referenceMiddleware(subscriptionOptions, "upgrade-subscription"),
+			originCheck((c) => {
+				return [c.body.successUrl, c.body.cancelUrl];
+			})
+		]
+	}, async (ctx) => {
+		const { user, session } = ctx.context.session;
+		const customerType = ctx.body.customerType || "user";
+		const referenceId = ctx.body.referenceId || getReferenceId(ctx.context.session, customerType, options);
+		if (!user.emailVerified && subscriptionOptions.requireEmailVerification) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.EMAIL_VERIFICATION_REQUIRED);
+		const plan = await getPlanByName(options, ctx.body.plan);
+		if (!plan) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_PLAN_NOT_FOUND);
+		const subscriptionToUpdate = ctx.body.subscriptionId ? await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: [{
+				field: "stripeSubscriptionId",
+				value: ctx.body.subscriptionId
+			}]
+		}) : null;
+		if (ctx.body.subscriptionId && !subscriptionToUpdate) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		if (ctx.body.subscriptionId && subscriptionToUpdate && subscriptionToUpdate.referenceId !== referenceId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		let customerId;
+		if (customerType === "organization") {
+			customerId = subscriptionToUpdate?.stripeCustomerId;
+			if (!customerId) {
+				const org = await ctx.context.adapter.findOne({
+					model: "organization",
+					where: [{
+						field: "id",
+						value: referenceId
+					}]
+				});
+				if (!org) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.ORGANIZATION_NOT_FOUND);
+				customerId = org.stripeCustomerId;
+				if (!customerId) try {
+					let stripeCustomer;
+					try {
+						stripeCustomer = (await client.customers.search({
+							query: `metadata["${customerMetadata.keys.organizationId}"]:"${org.id}"`,
+							limit: 1
+						})).data[0];
+					} catch {
+						ctx.context.logger.warn("Stripe customers.search failed, falling back to customers.list");
+						for await (const customer of client.customers.list({ limit: 100 })) if (customer.metadata?.[customerMetadata.keys.organizationId] === org.id) {
+							stripeCustomer = customer;
+							break;
+						}
+					}
+					if (!stripeCustomer) {
+						let extraCreateParams = {};
+						if (options.organization?.getCustomerCreateParams) extraCreateParams = await options.organization.getCustomerCreateParams(org, ctx);
+						const customerParams = defu({
+							name: org.name,
+							metadata: customerMetadata.set({
+								organizationId: org.id,
+								customerType: "organization"
+							}, ctx.body.metadata)
+						}, extraCreateParams);
+						stripeCustomer = await client.customers.create(customerParams);
+						await options.organization?.onCustomerCreate?.({
+							stripeCustomer,
+							organization: {
+								...org,
+								stripeCustomerId: stripeCustomer.id
+							}
+						}, ctx);
+					}
+					await ctx.context.adapter.update({
+						model: "organization",
+						update: { stripeCustomerId: stripeCustomer.id },
+						where: [{
+							field: "id",
+							value: org.id
+						}]
+					});
+					customerId = stripeCustomer.id;
+				} catch (e) {
+					ctx.context.logger.error(e);
+					throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.UNABLE_TO_CREATE_CUSTOMER);
+				}
+			}
+		} else {
+			customerId = subscriptionToUpdate?.stripeCustomerId || user.stripeCustomerId;
+			if (!customerId) try {
+				let stripeCustomer;
+				try {
+					stripeCustomer = (await client.customers.search({
+						query: `email:"${escapeStripeSearchValue(user.email)}" AND -metadata["${customerMetadata.keys.customerType}"]:"organization"`,
+						limit: 1
+					})).data[0];
+				} catch {
+					ctx.context.logger.warn("Stripe customers.search failed, falling back to customers.list");
+					for await (const customer of client.customers.list({
+						email: user.email,
+						limit: 100
+					})) if (customer.metadata?.[customerMetadata.keys.customerType] !== "organization") {
+						stripeCustomer = customer;
+						break;
+					}
+				}
+				if (!stripeCustomer) stripeCustomer = await client.customers.create({
+					email: user.email,
+					name: user.name,
+					metadata: customerMetadata.set({
+						userId: user.id,
+						customerType: "user"
+					}, ctx.body.metadata)
+				});
+				await ctx.context.adapter.update({
+					model: "user",
+					update: { stripeCustomerId: stripeCustomer.id },
+					where: [{
+						field: "id",
+						value: user.id
+					}]
+				});
+				customerId = stripeCustomer.id;
+			} catch (e) {
+				ctx.context.logger.error(e);
+				throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.UNABLE_TO_CREATE_CUSTOMER);
+			}
+		}
+		const subscriptions = subscriptionToUpdate ? [subscriptionToUpdate] : await ctx.context.adapter.findMany({
+			model: "subscription",
+			where: [{
+				field: "referenceId",
+				value: referenceId
+			}]
+		});
+		const activeOrTrialingSubscription = subscriptions.find((sub) => isActiveOrTrialing(sub));
+		const activeSubscription = (await client.subscriptions.list({ customer: customerId }).then((res) => res.data.filter((sub) => isActiveOrTrialing(sub)))).find((sub) => {
+			if (subscriptionToUpdate?.stripeSubscriptionId || ctx.body.subscriptionId) return sub.id === subscriptionToUpdate?.stripeSubscriptionId || sub.id === ctx.body.subscriptionId;
+			if (activeOrTrialingSubscription?.stripeSubscriptionId) return sub.id === activeOrTrialingSubscription.stripeSubscriptionId;
+			return false;
+		});
+		const planItem = (activeSubscription ? await resolvePlanItem(options, activeSubscription.items.data) : void 0)?.item;
+		const stripeSubscriptionPriceId = planItem?.price.id;
+		const incompleteSubscription = subscriptions.find((sub) => sub.status === "incomplete");
+		const priceId = ctx.body.annual ? plan.annualDiscountPriceId : plan.priceId;
+		const lookupKey = ctx.body.annual ? plan.annualDiscountLookupKey : plan.lookupKey;
+		const resolvedPriceId = lookupKey ? await resolvePriceIdFromLookupKey(client, lookupKey) : void 0;
+		const priceIdToUse = priceId || resolvedPriceId;
+		if (!priceIdToUse) throw ctx.error("BAD_REQUEST", { message: "Price ID not found for the selected plan" });
+		const isAutoManagedSeats = !!(plan.seatPriceId && customerType === "organization");
+		let memberCount = 0;
+		if (isAutoManagedSeats) memberCount = await ctx.context.adapter.count({
+			model: "member",
+			where: [{
+				field: "organizationId",
+				value: referenceId
+			}]
+		});
+		const isSamePlan = activeOrTrialingSubscription?.plan === ctx.body.plan;
+		const isSameSeats = isAutoManagedSeats ? true : activeOrTrialingSubscription?.seats === (ctx.body.seats || 1);
+		const isSamePriceId = stripeSubscriptionPriceId === priceIdToUse;
+		const isSubscriptionStillValid = !activeOrTrialingSubscription?.periodEnd || activeOrTrialingSubscription.periodEnd > /* @__PURE__ */ new Date();
+		const isSeatOnlyPlan = isAutoManagedSeats && plan.seatPriceId === plan.priceId;
+		if (activeOrTrialingSubscription?.status === "active" && isSamePlan && isSameSeats && isSamePriceId && isSubscriptionStillValid) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.ALREADY_SUBSCRIBED_PLAN);
+		if (activeSubscription && customerId) {
+			let dbSubscription = await ctx.context.adapter.findOne({
+				model: "subscription",
+				where: [{
+					field: "stripeSubscriptionId",
+					value: activeSubscription.id
+				}]
+			});
+			if (!dbSubscription && activeOrTrialingSubscription) {
+				await ctx.context.adapter.update({
+					model: "subscription",
+					update: {
+						stripeSubscriptionId: activeSubscription.id,
+						updatedAt: /* @__PURE__ */ new Date()
+					},
+					where: [{
+						field: "id",
+						value: activeOrTrialingSubscription.id
+					}]
+				});
+				dbSubscription = activeOrTrialingSubscription;
+			}
+			if (!planItem) throw APIError$1.from("NOT_FOUND", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+			if (activeSubscription.schedule) {
+				const { data: existingSchedules } = await client.subscriptionSchedules.list({ customer: customerId });
+				const existingSchedule = existingSchedules.find((s) => (typeof s.subscription === "string" ? s.subscription : s.subscription?.id) === activeSubscription.id && s.status === "active");
+				if (existingSchedule && existingSchedule.metadata?.source === "@better-auth/stripe") {
+					await client.subscriptionSchedules.release(existingSchedule.id);
+					if (dbSubscription) await ctx.context.adapter.update({
+						model: "subscription",
+						update: {
+							stripeScheduleId: null,
+							updatedAt: /* @__PURE__ */ new Date()
+						},
+						where: [{
+							field: "id",
+							value: dbSubscription.id
+						}]
+					});
+				}
+			}
+			const oldPlan = activeOrTrialingSubscription ? await getPlanByName(options, activeOrTrialingSubscription.plan) : void 0;
+			const priceMap = /* @__PURE__ */ new Map();
+			if (isAutoManagedSeats && plan.seatPriceId) {
+				if (oldPlan?.seatPriceId && oldPlan.seatPriceId !== plan.seatPriceId) priceMap.set(oldPlan.seatPriceId, {
+					newPrice: plan.seatPriceId,
+					quantity: memberCount
+				});
+			}
+			const lineItemDelta = /* @__PURE__ */ new Map();
+			for (const li of oldPlan?.lineItems ?? []) if (typeof li.price === "string") lineItemDelta.set(li.price, (lineItemDelta.get(li.price) ?? 0) - 1);
+			for (const li of plan.lineItems ?? []) if (typeof li.price === "string") lineItemDelta.set(li.price, (lineItemDelta.get(li.price) ?? 0) + 1);
+			for (const [price, delta] of lineItemDelta) if (delta === 0) lineItemDelta.delete(price);
+			let upgradeUrl;
+			if (ctx.body.scheduleAtPeriodEnd) {
+				const schedule = await client.subscriptionSchedules.create({ from_subscription: activeSubscription.id }).catch(async (e) => {
+					throw ctx.error("BAD_REQUEST", {
+						message: e.message,
+						code: e.code
+					});
+				});
+				const currentPhase = schedule.phases[0];
+				if (!currentPhase) throw ctx.error("BAD_REQUEST", { message: "Subscription schedule has no phases" });
+				const removeQuota = /* @__PURE__ */ new Map();
+				for (const [p, d] of lineItemDelta) if (d < 0) removeQuota.set(p, -d);
+				const newPhaseItems = [];
+				for (const item of currentPhase.items) {
+					const itemPriceId = typeof item.price === "string" ? item.price : item.price.id;
+					const quota = removeQuota.get(itemPriceId) ?? 0;
+					if (quota > 0) {
+						removeQuota.set(itemPriceId, quota - 1);
+						continue;
+					}
+					const replacement = priceMap.get(itemPriceId);
+					if (replacement) {
+						newPhaseItems.push({
+							price: replacement.newPrice,
+							quantity: replacement.quantity ?? item.quantity
+						});
+						continue;
+					}
+					if (itemPriceId === stripeSubscriptionPriceId) {
+						newPhaseItems.push({
+							price: priceIdToUse,
+							quantity: isAutoManagedSeats ? 1 : ctx.body.seats || 1
+						});
+						continue;
+					}
+					newPhaseItems.push({
+						price: itemPriceId,
+						quantity: item.quantity
+					});
+					const d = lineItemDelta.get(itemPriceId);
+					if (d !== void 0 && d > 0) if (d === 1) lineItemDelta.delete(itemPriceId);
+					else lineItemDelta.set(itemPriceId, d - 1);
+				}
+				for (const [price, delta] of lineItemDelta) for (let i = 0; i < delta; i++) newPhaseItems.push({ price });
+				await client.subscriptionSchedules.update(schedule.id, {
+					metadata: { source: "@better-auth/stripe" },
+					end_behavior: "release",
+					phases: [{
+						items: currentPhase.items.map((item) => ({
+							price: typeof item.price === "string" ? item.price : item.price.id,
+							quantity: item.quantity
+						})),
+						start_date: currentPhase.start_date,
+						end_date: currentPhase.end_date
+					}, {
+						items: newPhaseItems,
+						start_date: currentPhase.end_date,
+						proration_behavior: "none"
+					}]
+				}).catch(async (e) => {
+					throw ctx.error("BAD_REQUEST", {
+						message: e.message,
+						code: e.code
+					});
+				});
+				if (dbSubscription) await ctx.context.adapter.update({
+					model: "subscription",
+					update: {
+						stripeScheduleId: schedule.id,
+						updatedAt: /* @__PURE__ */ new Date()
+					},
+					where: [{
+						field: "id",
+						value: dbSubscription.id
+					}]
+				});
+				upgradeUrl = getUrl(ctx, ctx.body.returnUrl || "/");
+			} else if (priceMap.size > 0 || lineItemDelta.size > 0) {
+				const removeQuota = /* @__PURE__ */ new Map();
+				for (const [p, d] of lineItemDelta) if (d < 0) removeQuota.set(p, -d);
+				const itemUpdates = [];
+				for (const si of activeSubscription.items.data) {
+					const quota = removeQuota.get(si.price.id) ?? 0;
+					if (quota > 0) {
+						removeQuota.set(si.price.id, quota - 1);
+						itemUpdates.push({
+							id: si.id,
+							deleted: true
+						});
+						continue;
+					}
+					const replacement = priceMap.get(si.price.id);
+					if (replacement) {
+						itemUpdates.push({
+							id: si.id,
+							price: replacement.newPrice,
+							quantity: replacement.quantity
+						});
+						continue;
+					}
+					if (si.price.id === stripeSubscriptionPriceId) {
+						itemUpdates.push({
+							id: si.id,
+							price: priceIdToUse,
+							quantity: isAutoManagedSeats ? 1 : ctx.body.seats || 1
+						});
+						continue;
+					}
+					const d = lineItemDelta.get(si.price.id);
+					if (d !== void 0 && d > 0) if (d === 1) lineItemDelta.delete(si.price.id);
+					else lineItemDelta.set(si.price.id, d - 1);
+				}
+				for (const [price, delta] of lineItemDelta) for (let i = 0; i < delta; i++) itemUpdates.push({ price });
+				await client.subscriptions.update(activeSubscription.id, {
+					items: itemUpdates,
+					proration_behavior: "create_prorations"
+				}).catch(async (e) => {
+					throw ctx.error("BAD_REQUEST", {
+						message: e.message,
+						code: e.code
+					});
+				});
+				if (dbSubscription) await ctx.context.adapter.update({
+					model: "subscription",
+					update: {
+						plan: plan.name.toLowerCase(),
+						seats: memberCount,
+						updatedAt: /* @__PURE__ */ new Date()
+					},
+					where: [{
+						field: "id",
+						value: dbSubscription.id
+					}]
+				});
+				upgradeUrl = getUrl(ctx, ctx.body.returnUrl || "/");
+			} else ({url: upgradeUrl} = await client.billingPortal.sessions.create({
+				customer: customerId,
+				return_url: getUrl(ctx, ctx.body.returnUrl || "/"),
+				flow_data: {
+					type: "subscription_update_confirm",
+					after_completion: {
+						type: "redirect",
+						redirect: { return_url: getUrl(ctx, ctx.body.returnUrl || "/") }
+					},
+					subscription_update_confirm: {
+						subscription: activeSubscription.id,
+						items: [{
+							id: planItem.id,
+							price: priceIdToUse,
+							...isAutoManagedSeats ? {} : { quantity: ctx.body.seats || 1 }
+						}]
+					}
+				}
+			}).catch(async (e) => {
+				throw ctx.error("BAD_REQUEST", {
+					message: e.message,
+					code: e.code
+				});
+			}));
+			return ctx.json({
+				url: upgradeUrl,
+				redirect: !ctx.body.disableRedirect
+			});
+		}
+		let subscription = activeOrTrialingSubscription || incompleteSubscription;
+		if (incompleteSubscription && !activeOrTrialingSubscription) subscription = await ctx.context.adapter.update({
+			model: "subscription",
+			update: {
+				plan: plan.name.toLowerCase(),
+				seats: isAutoManagedSeats ? memberCount : ctx.body.seats || 1,
+				updatedAt: /* @__PURE__ */ new Date()
+			},
+			where: [{
+				field: "id",
+				value: incompleteSubscription.id
+			}]
+		}) || incompleteSubscription;
+		if (!subscription) subscription = await ctx.context.adapter.create({
+			model: "subscription",
+			data: {
+				plan: plan.name.toLowerCase(),
+				stripeCustomerId: customerId,
+				status: "incomplete",
+				referenceId,
+				seats: isAutoManagedSeats ? memberCount : ctx.body.seats || 1
+			}
+		});
+		if (!subscription) {
+			ctx.context.logger.error("Subscription ID not found");
+			throw APIError$1.from("NOT_FOUND", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		}
+		const params = await subscriptionOptions.getCheckoutSessionParams?.({
+			user,
+			session,
+			plan,
+			subscription
+		}, ctx.request, ctx);
+		const freeTrial = !(await ctx.context.adapter.findMany({
+			model: "subscription",
+			where: [{
+				field: "referenceId",
+				value: referenceId
+			}]
+		})).some((s) => {
+			return !!(s.trialStart || s.trialEnd) || s.status === "trialing";
+		}) && plan.freeTrial ? { trial_period_days: plan.freeTrial.days } : void 0;
+		const checkoutSession = await client.checkout.sessions.create({
+			...customerId ? {
+				customer: customerId,
+				customer_update: customerType !== "user" ? { address: "auto" } : {
+					name: "auto",
+					address: "auto"
+				}
+			} : { customer_email: user.email },
+			locale: ctx.body.locale,
+			success_url: getUrl(ctx, `${ctx.context.baseURL}/subscription/success?callbackURL=${encodeURIComponent(ctx.body.successUrl)}&checkoutSessionId={CHECKOUT_SESSION_ID}`),
+			cancel_url: getUrl(ctx, ctx.body.cancelUrl),
+			line_items: [
+				...!isSeatOnlyPlan ? [{
+					price: priceIdToUse,
+					quantity: isAutoManagedSeats ? 1 : ctx.body.seats || 1
+				}] : [],
+				...isAutoManagedSeats ? [{
+					price: plan.seatPriceId,
+					quantity: memberCount
+				}] : [],
+				...plan.lineItems ?? []
+			],
+			subscription_data: {
+				...freeTrial,
+				metadata: subscriptionMetadata.set({
+					userId: user.id,
+					subscriptionId: subscription.id,
+					referenceId
+				}, ctx.body.metadata, params?.params?.subscription_data?.metadata)
+			},
+			mode: "subscription",
+			client_reference_id: referenceId,
+			...params?.params,
+			metadata: subscriptionMetadata.set({
+				userId: user.id,
+				subscriptionId: subscription.id,
+				referenceId
+			}, ctx.body.metadata, params?.params?.metadata)
+		}, params?.options).catch(async (e) => {
+			throw ctx.error("BAD_REQUEST", {
+				message: e.message,
+				code: e.code
+			});
+		});
+		return ctx.json({
+			...checkoutSession,
+			redirect: !ctx.body.disableRedirect
+		});
+	});
+};
+const cancelSubscriptionBodySchema = z.object({
+	referenceId: z.string().meta({ description: "Reference id of the subscription to cancel. Eg: '123'" }).optional(),
+	subscriptionId: z.string().meta({ description: "The Stripe subscription ID to cancel. Eg: 'sub_1ABC2DEF3GHI4JKL'" }).optional(),
+	customerType: z.enum(["user", "organization"]).meta({ description: "Customer type for the subscription. Eg: \"user\" or \"organization\"" }).optional(),
+	returnUrl: z.string().meta({ description: "URL to take customers to when they click on the billing portal's link to return to your website. Eg: \"/account\"" }),
+	disableRedirect: z.boolean().meta({ description: "Disable redirect after successful subscription cancellation. Eg: true" }).default(false)
+});
+/**
+* ### Endpoint
+*
+* POST `/subscription/cancel`
+*
+* ### API Methods
+*
+* **server:**
+* `auth.api.cancelSubscription`
+*
+* **client:**
+* `authClient.subscription.cancel`
+*
+* @see [Read our docs to learn more.](https://better-auth.com/docs/plugins/stripe#api-method-subscription-cancel)
+*/
+const cancelSubscription = (options) => {
+	const client = options.stripeClient;
+	const subscriptionOptions = options.subscription;
+	return createAuthEndpoint("/subscription/cancel", {
+		method: "POST",
+		body: cancelSubscriptionBodySchema,
+		metadata: { openapi: { operationId: "cancelSubscription" } },
+		use: [
+			stripeSessionMiddleware,
+			referenceMiddleware(subscriptionOptions, "cancel-subscription"),
+			originCheck((ctx) => ctx.body.returnUrl)
+		]
+	}, async (ctx) => {
+		const customerType = ctx.body.customerType || "user";
+		const referenceId = ctx.body.referenceId || getReferenceId(ctx.context.session, customerType, options);
+		let subscription = ctx.body.subscriptionId ? await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: [{
+				field: "stripeSubscriptionId",
+				value: ctx.body.subscriptionId
+			}]
+		}) : await ctx.context.adapter.findMany({
+			model: "subscription",
+			where: [{
+				field: "referenceId",
+				value: referenceId
+			}]
+		}).then((subs) => subs.find((sub) => isActiveOrTrialing(sub)));
+		if (ctx.body.subscriptionId && subscription && subscription.referenceId !== referenceId) subscription = void 0;
+		if (!subscription || !subscription.stripeCustomerId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		const activeSubscriptions = await client.subscriptions.list({ customer: subscription.stripeCustomerId }).then((res) => res.data.filter((sub) => isActiveOrTrialing(sub)));
+		if (!activeSubscriptions.length) {
+			/**
+			* If the subscription is not found, we need to delete the subscription
+			* from the database. This is a rare case and should not happen.
+			*/
+			await ctx.context.adapter.deleteMany({
+				model: "subscription",
+				where: [{
+					field: "referenceId",
+					value: referenceId
+				}]
+			});
+			throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		}
+		const activeSubscription = activeSubscriptions.find((sub) => sub.id === subscription.stripeSubscriptionId);
+		if (!activeSubscription) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		const { url } = await client.billingPortal.sessions.create({
+			customer: subscription.stripeCustomerId,
+			return_url: getUrl(ctx, ctx.body?.returnUrl || "/"),
+			flow_data: {
+				type: "subscription_cancel",
+				subscription_cancel: { subscription: activeSubscription.id }
+			}
+		}).catch(async (e) => {
+			if (e.message?.includes("already set to be canceled")) {
+				/**
+				* in-case we missed the event from stripe, we sync the actual state
+				* this is a rare case and should not happen
+				*/
+				if (!isPendingCancel(subscription)) {
+					const stripeSub = await client.subscriptions.retrieve(activeSubscription.id);
+					await ctx.context.adapter.update({
+						model: "subscription",
+						update: {
+							cancelAtPeriodEnd: stripeSub.cancel_at_period_end,
+							cancelAt: stripeSub.cancel_at ? /* @__PURE__ */ new Date(stripeSub.cancel_at * 1e3) : null,
+							canceledAt: stripeSub.canceled_at ? /* @__PURE__ */ new Date(stripeSub.canceled_at * 1e3) : null
+						},
+						where: [{
+							field: "id",
+							value: subscription.id
+						}]
+					});
+				}
+			}
+			throw ctx.error("BAD_REQUEST", {
+				message: e.message,
+				code: e.code
+			});
+		});
+		return ctx.json({
+			url,
+			redirect: !ctx.body.disableRedirect
+		});
+	});
+};
+const restoreSubscriptionBodySchema = z.object({
+	referenceId: z.string().meta({ description: "Reference id of the subscription to restore. Eg: '123'" }).optional(),
+	subscriptionId: z.string().meta({ description: "The Stripe subscription ID to restore. Eg: 'sub_1ABC2DEF3GHI4JKL'" }).optional(),
+	customerType: z.enum(["user", "organization"]).meta({ description: "Customer type for the subscription. Eg: \"user\" or \"organization\"" }).optional()
+});
+const restoreSubscription = (options) => {
+	const client = options.stripeClient;
+	const subscriptionOptions = options.subscription;
+	return createAuthEndpoint("/subscription/restore", {
+		method: "POST",
+		body: restoreSubscriptionBodySchema,
+		metadata: { openapi: { operationId: "restoreSubscription" } },
+		use: [stripeSessionMiddleware, referenceMiddleware(subscriptionOptions, "restore-subscription")]
+	}, async (ctx) => {
+		const customerType = ctx.body.customerType || "user";
+		const referenceId = ctx.body.referenceId || getReferenceId(ctx.context.session, customerType, options);
+		let subscription = ctx.body.subscriptionId ? await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: [{
+				field: "stripeSubscriptionId",
+				value: ctx.body.subscriptionId
+			}]
+		}) : await ctx.context.adapter.findMany({
+			model: "subscription",
+			where: [{
+				field: "referenceId",
+				value: referenceId
+			}]
+		}).then((subs) => subs.find((sub) => isActiveOrTrialing(sub)));
+		if (ctx.body.subscriptionId && subscription && subscription.referenceId !== referenceId) subscription = void 0;
+		if (!subscription || !subscription.stripeCustomerId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		if (!isActiveOrTrialing(subscription)) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
+		const hasPendingCancel = isPendingCancel(subscription);
+		const { stripeScheduleId } = subscription;
+		if (!hasPendingCancel && !stripeScheduleId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_PENDING_CHANGE);
+		if (stripeScheduleId) {
+			if (!subscription.stripeSubscriptionId) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+			if ((await client.subscriptionSchedules.retrieve(stripeScheduleId).catch((e) => {
+				throw ctx.error("BAD_REQUEST", {
+					message: e.message,
+					code: e.code
+				});
+			})).status === "active") await client.subscriptionSchedules.release(stripeScheduleId).catch((e) => {
+				throw ctx.error("BAD_REQUEST", {
+					message: e.message,
+					code: e.code
+				});
+			});
+			await ctx.context.adapter.update({
+				model: "subscription",
+				update: {
+					stripeScheduleId: null,
+					updatedAt: /* @__PURE__ */ new Date()
+				},
+				where: [{
+					field: "id",
+					value: subscription.id
+				}]
+			});
+			const releasedSub = await client.subscriptions.retrieve(subscription.stripeSubscriptionId);
+			return ctx.json(releasedSub);
+		}
+		const activeSubscription = await client.subscriptions.list({ customer: subscription.stripeCustomerId }).then((res) => res.data.filter((sub) => isActiveOrTrialing(sub))[0]);
+		if (!activeSubscription) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+		const updateParams = {};
+		if (activeSubscription.cancel_at) updateParams.cancel_at = "";
+		else if (activeSubscription.cancel_at_period_end) updateParams.cancel_at_period_end = false;
+		const newSub = await client.subscriptions.update(activeSubscription.id, updateParams).catch((e) => {
+			throw ctx.error("BAD_REQUEST", {
+				message: e.message,
+				code: e.code
+			});
+		});
+		await ctx.context.adapter.update({
+			model: "subscription",
+			update: {
+				cancelAtPeriodEnd: false,
+				cancelAt: null,
+				canceledAt: null,
+				updatedAt: /* @__PURE__ */ new Date()
+			},
+			where: [{
+				field: "id",
+				value: subscription.id
+			}]
+		});
+		return ctx.json(newSub);
+	});
+};
+const listActiveSubscriptionsQuerySchema = z.optional(z.object({
+	referenceId: z.string().meta({ description: "Reference id of the subscription to list. Eg: '123'" }).optional(),
+	customerType: z.enum(["user", "organization"]).meta({ description: "Customer type for the subscription. Eg: \"user\" or \"organization\"" }).optional()
+}));
+/**
+* ### Endpoint
+*
+* GET `/subscription/list`
+*
+* ### API Methods
+*
+* **server:**
+* `auth.api.listActiveSubscriptions`
+*
+* **client:**
+* `authClient.subscription.list`
+*
+* @see [Read our docs to learn more.](https://better-auth.com/docs/plugins/stripe#api-method-subscription-list)
+*/
+const listActiveSubscriptions = (options) => {
+	const subscriptionOptions = options.subscription;
+	return createAuthEndpoint("/subscription/list", {
+		method: "GET",
+		query: listActiveSubscriptionsQuerySchema,
+		metadata: { openapi: { operationId: "listActiveSubscriptions" } },
+		use: [stripeSessionMiddleware, referenceMiddleware(subscriptionOptions, "list-subscription")]
+	}, async (ctx) => {
+		const customerType = ctx.query?.customerType || "user";
+		const referenceId = ctx.query?.referenceId || getReferenceId(ctx.context.session, customerType, options);
+		const subscriptions = await ctx.context.adapter.findMany({
+			model: "subscription",
+			where: [{
+				field: "referenceId",
+				value: referenceId
+			}]
+		});
+		if (!subscriptions.length) return [];
+		const plans = await getPlans(options.subscription);
+		if (!plans) return [];
+		const subs = subscriptions.map((sub) => {
+			const plan = plans.find((p) => p.name.toLowerCase() === sub.plan.toLowerCase());
+			return {
+				...sub,
+				limits: plan?.limits,
+				priceId: plan?.priceId
+			};
+		}).filter((sub) => isActiveOrTrialing(sub));
+		return ctx.json(subs);
+	});
+};
+const subscriptionSuccessQuerySchema = z.record(z.string(), z.any()).optional();
+const subscriptionSuccess = (options) => {
+	const client = options.stripeClient;
+	return createAuthEndpoint("/subscription/success", {
+		method: "GET",
+		query: subscriptionSuccessQuerySchema,
+		metadata: { openapi: { operationId: "handleSubscriptionSuccess" } },
+		use: [originCheck((ctx) => ctx.query.callbackURL)]
+	}, async (ctx) => {
+		const callbackURL = ctx.query?.callbackURL || "/";
+		const session = await getSessionFromCtx(ctx);
+		if (!session) throw ctx.redirect(getUrl(ctx, callbackURL));
+		if (!ctx.query?.checkoutSessionId) throw ctx.redirect(getUrl(ctx, callbackURL));
+		const checkoutSession = await client.checkout.sessions.retrieve(ctx.query.checkoutSessionId).catch((error) => {
+			ctx.context.logger.error("Error retrieving checkout session from Stripe", error);
+			return null;
+		});
+		if (!checkoutSession) throw ctx.redirect(getUrl(ctx, callbackURL));
+		const { subscriptionId } = subscriptionMetadata.get(checkoutSession.metadata);
+		if (!subscriptionId) {
+			ctx.context.logger.warn(`No subscriptionId in checkout session metadata: ${checkoutSession.id}`);
+			throw ctx.redirect(getUrl(ctx, callbackURL));
+		}
+		const subscription = await ctx.context.adapter.findOne({
+			model: "subscription",
+			where: [{
+				field: "id",
+				value: subscriptionId
+			}]
+		});
+		if (!subscription) {
+			ctx.context.logger.warn(`Subscription record not found for subscriptionId: ${subscriptionId}`);
+			throw ctx.redirect(getUrl(ctx, callbackURL));
+		}
+		if (isActiveOrTrialing(subscription)) throw ctx.redirect(getUrl(ctx, callbackURL));
+		const customerId = subscription.stripeCustomerId || session.user.stripeCustomerId;
+		if (!customerId) throw ctx.redirect(getUrl(ctx, callbackURL));
+		const stripeSubscription = await client.subscriptions.list({
+			customer: customerId,
+			status: "active"
+		}).then((res) => res.data[0]).catch((error) => {
+			ctx.context.logger.error("Error fetching subscription from Stripe", error);
+			throw ctx.redirect(getUrl(ctx, callbackURL));
+		});
+		if (!stripeSubscription) throw ctx.redirect(getUrl(ctx, callbackURL));
+		const resolved = await resolvePlanItem(options, stripeSubscription.items.data);
+		if (!resolved) {
+			ctx.context.logger.warn(`No subscription items found for Stripe subscription ${stripeSubscription.id}`);
+			throw ctx.redirect(getUrl(ctx, callbackURL));
+		}
+		const { item: subscriptionItem, plan } = resolved;
+		if (!plan) {
+			ctx.context.logger.warn(`Plan not found for price ${subscriptionItem.price.id}`);
+			throw ctx.redirect(getUrl(ctx, callbackURL));
+		}
+		const seats = resolveQuantity(stripeSubscription.items.data, subscriptionItem, plan.seatPriceId) || 1;
+		await ctx.context.adapter.update({
+			model: "subscription",
+			update: {
+				...stripeSubscription.trial_start && stripeSubscription.trial_end ? {
+					trialStart: /* @__PURE__ */ new Date(stripeSubscription.trial_start * 1e3),
+					trialEnd: /* @__PURE__ */ new Date(stripeSubscription.trial_end * 1e3)
+				} : {},
+				status: stripeSubscription.status,
+				seats,
+				plan: plan.name.toLowerCase(),
+				billingInterval: subscriptionItem.price.recurring?.interval,
+				periodEnd: /* @__PURE__ */ new Date(subscriptionItem.current_period_end * 1e3),
+				periodStart: /* @__PURE__ */ new Date(subscriptionItem.current_period_start * 1e3),
+				stripeSubscriptionId: stripeSubscription.id,
+				cancelAtPeriodEnd: stripeSubscription.cancel_at_period_end,
+				cancelAt: stripeSubscription.cancel_at ? /* @__PURE__ */ new Date(stripeSubscription.cancel_at * 1e3) : null,
+				canceledAt: stripeSubscription.canceled_at ? /* @__PURE__ */ new Date(stripeSubscription.canceled_at * 1e3) : null
+			},
+			where: [{
+				field: "id",
+				value: subscription.id
+			}]
+		});
+		throw ctx.redirect(getUrl(ctx, callbackURL));
+	});
+};
+const createBillingPortalBodySchema = z.object({
+	locale: z.custom((localization) => {
+		return typeof localization === "string";
+	}).meta({ description: "The IETF language tag of the locale Customer Portal is displayed in. Eg: 'en', 'ko'. If not provided or set to `auto`, the browser's locale is used." }).optional(),
+	referenceId: z.string().optional(),
+	customerType: z.enum(["user", "organization"]).meta({ description: "Customer type for the subscription. Eg: \"user\" or \"organization\"" }).optional(),
+	returnUrl: z.string().default("/"),
+	disableRedirect: z.boolean().meta({ description: "Disable redirect after creating billing portal session. Eg: true" }).default(false)
+});
+const createBillingPortal = (options) => {
+	const client = options.stripeClient;
+	const subscriptionOptions = options.subscription;
+	return createAuthEndpoint("/subscription/billing-portal", {
+		method: "POST",
+		body: createBillingPortalBodySchema,
+		metadata: { openapi: { operationId: "createBillingPortal" } },
+		use: [
+			stripeSessionMiddleware,
+			referenceMiddleware(subscriptionOptions, "billing-portal"),
+			originCheck((ctx) => ctx.body.returnUrl)
+		]
+	}, async (ctx) => {
+		const { user } = ctx.context.session;
+		const customerType = ctx.body.customerType || "user";
+		const referenceId = ctx.body.referenceId || getReferenceId(ctx.context.session, customerType, options);
+		let customerId;
+		if (customerType === "organization") {
+			customerId = (await ctx.context.adapter.findOne({
+				model: "organization",
+				where: [{
+					field: "id",
+					value: referenceId
+				}]
+			}))?.stripeCustomerId;
+			if (!customerId) customerId = (await ctx.context.adapter.findMany({
+				model: "subscription",
+				where: [{
+					field: "referenceId",
+					value: referenceId
+				}]
+			}).then((subs) => subs.find((sub) => isActiveOrTrialing(sub))))?.stripeCustomerId;
+		} else {
+			customerId = user.stripeCustomerId;
+			if (!customerId) customerId = (await ctx.context.adapter.findMany({
+				model: "subscription",
+				where: [{
+					field: "referenceId",
+					value: referenceId
+				}]
+			}).then((subs) => subs.find((sub) => isActiveOrTrialing(sub))))?.stripeCustomerId;
+		}
+		if (!customerId) throw APIError$1.from("NOT_FOUND", STRIPE_ERROR_CODES.CUSTOMER_NOT_FOUND);
+		try {
+			const { url } = await client.billingPortal.sessions.create({
+				locale: ctx.body.locale,
+				customer: customerId,
+				return_url: getUrl(ctx, ctx.body.returnUrl)
+			});
+			return ctx.json({
+				url,
+				redirect: !ctx.body.disableRedirect
+			});
+		} catch (error) {
+			ctx.context.logger.error("Error creating billing portal session", error);
+			throw APIError$1.from("INTERNAL_SERVER_ERROR", STRIPE_ERROR_CODES.UNABLE_TO_CREATE_BILLING_PORTAL);
+		}
+	});
+};
+const stripeWebhook = (options) => {
+	const client = options.stripeClient;
+	return createAuthEndpoint("/stripe/webhook", {
+		method: "POST",
+		metadata: {
+			...HIDE_METADATA,
+			openapi: { operationId: "handleStripeWebhook" }
+		},
+		cloneRequest: true,
+		disableBody: true
+	}, async (ctx) => {
+		if (!ctx.request?.body) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.INVALID_REQUEST_BODY);
+		const sig = ctx.request.headers.get("stripe-signature");
+		if (!sig) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.STRIPE_SIGNATURE_NOT_FOUND);
+		const webhookSecret = options.stripeWebhookSecret;
+		if (!webhookSecret) throw APIError$1.from("INTERNAL_SERVER_ERROR", STRIPE_ERROR_CODES.STRIPE_WEBHOOK_SECRET_NOT_FOUND);
+		const payload = await ctx.request.text();
+		let event;
+		try {
+			if (typeof client.webhooks.constructEventAsync === "function") event = await client.webhooks.constructEventAsync(payload, sig, webhookSecret);
+			else event = client.webhooks.constructEvent(payload, sig, webhookSecret);
+		} catch (err) {
+			ctx.context.logger.error(`${err.message}`);
+			throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.FAILED_TO_CONSTRUCT_STRIPE_EVENT);
+		}
+		if (!event) throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.FAILED_TO_CONSTRUCT_STRIPE_EVENT);
+		try {
+			switch (event.type) {
+				case "checkout.session.completed":
+					await onCheckoutSessionCompleted(ctx, options, event);
+					await options.onEvent?.(event);
+					break;
+				case "customer.subscription.created":
+					await onSubscriptionCreated(ctx, options, event);
+					await options.onEvent?.(event);
+					break;
+				case "customer.subscription.updated":
+					await onSubscriptionUpdated(ctx, options, event);
+					await options.onEvent?.(event);
+					break;
+				case "customer.subscription.deleted":
+					await onSubscriptionDeleted(ctx, options, event);
+					await options.onEvent?.(event);
+					break;
+				default:
+					await options.onEvent?.(event);
+					break;
+			}
+		} catch (e) {
+			ctx.context.logger.error(`Stripe webhook failed. Error: ${e.message}`);
+			throw APIError$1.from("BAD_REQUEST", STRIPE_ERROR_CODES.STRIPE_WEBHOOK_ERROR);
+		}
+		return ctx.json({ success: true });
+	});
+};
+
+//#endregion
+//#region src/schema.ts
+const subscriptions = { subscription: { fields: {
+	plan: {
+		type: "string",
+		required: true
+	},
+	referenceId: {
+		type: "string",
+		required: true
+	},
+	stripeCustomerId: {
+		type: "string",
+		required: false
+	},
+	stripeSubscriptionId: {
+		type: "string",
+		required: false
+	},
+	status: {
+		type: "string",
+		defaultValue: "incomplete"
+	},
+	periodStart: {
+		type: "date",
+		required: false
+	},
+	periodEnd: {
+		type: "date",
+		required: false
+	},
+	trialStart: {
+		type: "date",
+		required: false
+	},
+	trialEnd: {
+		type: "date",
+		required: false
+	},
+	cancelAtPeriodEnd: {
+		type: "boolean",
+		required: false,
+		defaultValue: false
+	},
+	cancelAt: {
+		type: "date",
+		required: false
+	},
+	canceledAt: {
+		type: "date",
+		required: false
+	},
+	endedAt: {
+		type: "date",
+		required: false
+	},
+	seats: {
+		type: "number",
+		required: false
+	},
+	billingInterval: {
+		type: "string",
+		required: false
+	},
+	stripeScheduleId: {
+		type: "string",
+		required: false
+	}
+} } };
+const user = { user: { fields: { stripeCustomerId: {
+	type: "string",
+	required: false
+} } } };
+const organization = { organization: { fields: { stripeCustomerId: {
+	type: "string",
+	required: false
+} } } };
+const getSchema = (options) => {
+	let baseSchema = {};
+	if (options.subscription?.enabled) baseSchema = {
+		...subscriptions,
+		...user
+	};
+	else baseSchema = { ...user };
+	if (options.organization?.enabled) baseSchema = {
+		...baseSchema,
+		...organization
+	};
+	if (options.schema && !options.subscription?.enabled && "subscription" in options.schema) {
+		const { subscription: _subscription, ...restSchema } = options.schema;
+		return mergeSchema(baseSchema, restSchema);
+	}
+	return mergeSchema(baseSchema, options.schema);
+};
+
+//#endregion
+//#region src/index.ts
+const stripe = (options) => {
+	const client = options.stripeClient;
+	const subscriptionEndpoints = {
+		upgradeSubscription: upgradeSubscription(options),
+		cancelSubscription: cancelSubscription(options),
+		restoreSubscription: restoreSubscription(options),
+		listActiveSubscriptions: listActiveSubscriptions(options),
+		subscriptionSuccess: subscriptionSuccess(options),
+		createBillingPortal: createBillingPortal(options)
+	};
+	return {
+		id: "stripe",
+		endpoints: {
+			stripeWebhook: stripeWebhook(options),
+			...options.subscription?.enabled ? subscriptionEndpoints : {}
+		},
+		init(ctx) {
+			if (options.subscription?.enabled && !options.organization?.enabled) {
+				const warnIfSeatPricing = (plans) => {
+					if (plans.some((p) => p.seatPriceId)) ctx.logger.error("seatPriceId is configured on a plan but stripe organization option is not enabled. Seat-based billing requires `organization: { enabled: true }` in stripe plugin options.");
+				};
+				const { plans } = options.subscription;
+				if (typeof plans === "function") Promise.resolve(plans()).then(warnIfSeatPricing).catch((e) => {
+					ctx.logger.error(`Failed to resolve plans for seat pricing validation: ${e.message}`);
+				});
+				else warnIfSeatPricing(plans);
+			}
+			if (options.organization?.enabled) {
+				const orgPlugin = ctx.getPlugin("organization");
+				if (!orgPlugin) {
+					ctx.logger.error(`Organization plugin not found`);
+					return;
+				}
+				const existingHooks = orgPlugin.options.organizationHooks ?? {};
+				/**
+				* Sync organization name to Stripe customer
+				*/
+				const afterUpdateStripeOrg = async (data) => {
+					const { organization } = data;
+					if (!organization?.stripeCustomerId) return;
+					try {
+						const stripeCustomer = await client.customers.retrieve(organization.stripeCustomerId);
+						if (stripeCustomer.deleted) {
+							ctx.logger.warn(`Stripe customer ${organization.stripeCustomerId} was deleted`);
+							return;
+						}
+						if (organization.name !== stripeCustomer.name) {
+							await client.customers.update(organization.stripeCustomerId, { name: organization.name });
+							ctx.logger.info(`Synced organization name to Stripe: "${stripeCustomer.name}" → "${organization.name}"`);
+						}
+					} catch (e) {
+						ctx.logger.error(`Failed to sync organization to Stripe: ${e.message}`);
+					}
+				};
+				/**
+				* Block deletion if organization has active subscriptions
+				*/
+				const beforeDeleteStripeOrg = async (data) => {
+					const { organization } = data;
+					if (!organization.stripeCustomerId) return;
+					try {
+						const subscriptions = await client.subscriptions.list({
+							customer: organization.stripeCustomerId,
+							status: "all",
+							limit: 100
+						});
+						for (const sub of subscriptions.data) if (sub.status !== "canceled" && sub.status !== "incomplete" && sub.status !== "incomplete_expired") throw APIError.from("BAD_REQUEST", STRIPE_ERROR_CODES.ORGANIZATION_HAS_ACTIVE_SUBSCRIPTION);
+					} catch (error) {
+						if (error instanceof APIError) throw error;
+						ctx.logger.error(`Failed to check organization subscriptions: ${error.message}`);
+						throw error;
+					}
+				};
+				/**
+				* Sync seat quantity to Stripe when organization members change.
+				* quantity = memberCount; Stripe graduated pricing handles free tiers.
+				*/
+				const syncSeatsAfterMemberChange = async (data) => {
+					if (!options.subscription?.enabled || !data.organization?.stripeCustomerId) return;
+					try {
+						const memberCount = await ctx.adapter.count({
+							model: "member",
+							where: [{
+								field: "organizationId",
+								value: data.organization.id
+							}]
+						});
+						const seatPlans = (await getPlans(options.subscription)).filter((p) => p.seatPriceId);
+						if (seatPlans.length === 0) return;
+						const seatPlanNames = new Set(seatPlans.map((p) => p.name.toLowerCase()));
+						const dbSub = await ctx.adapter.findOne({
+							model: "subscription",
+							where: [{
+								field: "referenceId",
+								value: data.organization.id
+							}]
+						});
+						if (!dbSub?.stripeSubscriptionId || !isActiveOrTrialing(dbSub) || !seatPlanNames.has(dbSub.plan)) return;
+						const { seatPriceId } = seatPlans.find((p) => p.name.toLowerCase() === dbSub.plan);
+						const stripeSub = await client.subscriptions.retrieve(dbSub.stripeSubscriptionId);
+						if (!isActiveOrTrialing(stripeSub)) return;
+						const seatItem = stripeSub.items.data.find((item) => item.price.id === seatPriceId);
+						if (seatItem?.quantity === memberCount) return;
+						const items = seatItem ? [{
+							id: seatItem.id,
+							quantity: memberCount
+						}] : [{
+							price: seatPriceId,
+							quantity: memberCount
+						}];
+						await client.subscriptions.update(stripeSub.id, {
+							items,
+							proration_behavior: "create_prorations"
+						});
+						await ctx.adapter.update({
+							model: "subscription",
+							update: { seats: memberCount },
+							where: [{
+								field: "id",
+								value: dbSub.id
+							}]
+						});
+					} catch (e) {
+						ctx.logger.error(`Failed to sync seats to Stripe: ${e.message}`);
+					}
+				};
+				orgPlugin.options.organizationHooks = {
+					...existingHooks,
+					afterUpdateOrganization: existingHooks.afterUpdateOrganization ? async (data) => {
+						await existingHooks.afterUpdateOrganization(data);
+						await afterUpdateStripeOrg(data);
+					} : afterUpdateStripeOrg,
+					beforeDeleteOrganization: existingHooks.beforeDeleteOrganization ? async (data) => {
+						await existingHooks.beforeDeleteOrganization(data);
+						await beforeDeleteStripeOrg(data);
+					} : beforeDeleteStripeOrg,
+					afterAddMember: existingHooks.afterAddMember ? async (data) => {
+						await existingHooks.afterAddMember(data);
+						await syncSeatsAfterMemberChange(data);
+					} : syncSeatsAfterMemberChange,
+					afterRemoveMember: existingHooks.afterRemoveMember ? async (data) => {
+						await existingHooks.afterRemoveMember(data);
+						await syncSeatsAfterMemberChange(data);
+					} : syncSeatsAfterMemberChange,
+					afterAcceptInvitation: existingHooks.afterAcceptInvitation ? async (data) => {
+						await existingHooks.afterAcceptInvitation(data);
+						await syncSeatsAfterMemberChange(data);
+					} : syncSeatsAfterMemberChange
+				};
+			}
+			return { options: { databaseHooks: { user: {
+				create: { async after(user, ctx) {
+					if (!ctx || !options.createCustomerOnSignUp || user.stripeCustomerId) return;
+					try {
+						let stripeCustomer;
+						try {
+							stripeCustomer = (await client.customers.search({
+								query: `email:"${escapeStripeSearchValue(user.email)}" AND -metadata["${customerMetadata.keys.customerType}"]:"organization"`,
+								limit: 1
+							})).data[0];
+						} catch {
+							ctx.context.logger.warn("Stripe customers.search failed, falling back to customers.list");
+							for await (const customer of client.customers.list({
+								email: user.email,
+								limit: 100
+							})) if (customer.metadata?.[customerMetadata.keys.customerType] !== "organization") {
+								stripeCustomer = customer;
+								break;
+							}
+						}
+						if (stripeCustomer) {
+							await ctx.context.internalAdapter.updateUser(user.id, { stripeCustomerId: stripeCustomer.id });
+							await options.onCustomerCreate?.({
+								stripeCustomer,
+								user: {
+									...user,
+									stripeCustomerId: stripeCustomer.id
+								}
+							}, ctx);
+							ctx.context.logger.info(`Linked existing Stripe customer ${stripeCustomer.id} to user ${user.id}`);
+							return;
+						}
+						let extraCreateParams = {};
+						if (options.getCustomerCreateParams) extraCreateParams = await options.getCustomerCreateParams(user, ctx);
+						const params = defu({
+							email: user.email,
+							name: user.name,
+							metadata: customerMetadata.set({
+								userId: user.id,
+								customerType: "user"
+							}, extraCreateParams?.metadata)
+						}, extraCreateParams);
+						stripeCustomer = await client.customers.create(params);
+						await ctx.context.internalAdapter.updateUser(user.id, { stripeCustomerId: stripeCustomer.id });
+						await options.onCustomerCreate?.({
+							stripeCustomer,
+							user: {
+								...user,
+								stripeCustomerId: stripeCustomer.id
+							}
+						}, ctx);
+						ctx.context.logger.info(`Created new Stripe customer ${stripeCustomer.id} for user ${user.id}`);
+					} catch (e) {
+						ctx.context.logger.error(`Failed to create or link Stripe customer: ${e.message}`, e);
+					}
+				} },
+				update: { async after(user, ctx) {
+					if (!ctx || !user.stripeCustomerId) return;
+					try {
+						const stripeCustomer = await client.customers.retrieve(user.stripeCustomerId);
+						if (stripeCustomer.deleted) {
+							ctx.context.logger.warn(`Stripe customer ${user.stripeCustomerId} was deleted, cannot update email`);
+							return;
+						}
+						if (stripeCustomer.email !== user.email) {
+							await client.customers.update(user.stripeCustomerId, { email: user.email });
+							ctx.context.logger.info(`Updated Stripe customer email from ${stripeCustomer.email} to ${user.email}`);
+						}
+					} catch (e) {
+						ctx.context.logger.error(`Failed to sync email to Stripe customer: ${e.message}`, e);
+					}
+				} }
+			} } } };
+		},
+		schema: getSchema(options),
+		options,
+		$ERROR_CODES: STRIPE_ERROR_CODES
+	};
+};
+
+//#endregion
+export { stripe };
+//# sourceMappingURL=index.mjs.map

@@ -1,0 +1,5 @@
+function createR2Config(config) {
+  return config;
+}
+
+export { createR2Config };

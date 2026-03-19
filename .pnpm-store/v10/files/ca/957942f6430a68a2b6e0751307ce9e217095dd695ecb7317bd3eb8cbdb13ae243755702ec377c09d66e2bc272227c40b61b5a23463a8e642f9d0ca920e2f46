@@ -1,0 +1,111 @@
+'use strict';
+
+const geolocationFields = {
+  timezone: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  city: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  country: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  region: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  regionCode: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  colo: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  latitude: {
+    type: "string",
+    required: false,
+    input: false
+  },
+  longitude: {
+    type: "string",
+    required: false,
+    input: false
+  }
+};
+const coreFileFields = {
+  userId: {
+    type: "string",
+    required: true,
+    input: false,
+    references: {
+      model: "user",
+      field: "id"
+    }
+  },
+  filename: {
+    type: "string",
+    required: true,
+    input: false
+  },
+  originalName: {
+    type: "string",
+    required: true,
+    input: false
+  },
+  contentType: {
+    type: "string",
+    required: true,
+    input: false
+  },
+  size: {
+    type: "number",
+    required: true,
+    input: false
+  },
+  r2Key: {
+    type: "string",
+    required: true,
+    input: false
+  },
+  uploadedAt: {
+    type: "date",
+    required: true,
+    input: false
+  }
+};
+function generateFileFields(additionalFields) {
+  const fields = { ...coreFileFields };
+  if (additionalFields) {
+    for (const [fieldName, fieldConfig] of Object.entries(additionalFields)) {
+      fields[fieldName] = fieldConfig;
+    }
+  }
+  return fields;
+}
+const schema = (options) => {
+  const sessionFields = options.geolocationTracking === void 0 || options.geolocationTracking === true ? geolocationFields : {};
+  const authSchema = {
+    session: {
+      fields: sessionFields
+    }
+  };
+  if (options.r2) {
+    const fileFields = generateFileFields(options.r2.additionalFields);
+    authSchema.userFile = {
+      fields: fileFields
+    };
+  }
+  return authSchema;
+};
+
+exports.schema = schema;

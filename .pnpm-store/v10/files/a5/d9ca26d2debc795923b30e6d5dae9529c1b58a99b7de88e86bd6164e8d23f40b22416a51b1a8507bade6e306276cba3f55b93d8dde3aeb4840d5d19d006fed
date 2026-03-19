@@ -1,0 +1,702 @@
+'use strict';
+
+const api = require('better-auth/api');
+const mime = require('mime/lite');
+const zod = require('zod');
+
+function _interopDefaultCompat (e) { return e && typeof e === 'object' && 'default' in e ? e.default : e; }
+
+const mime__default = /*#__PURE__*/_interopDefaultCompat(mime);
+
+const R2_ERROR_CODES = {
+  FILE_TOO_LARGE: "File is too large. Please choose a smaller file",
+  INVALID_FILE_TYPE: "File type not supported. Please choose a different file",
+  NO_FILE_PROVIDED: "Please select a file to upload",
+  INVALID_REQUEST: "Invalid request. Please try again",
+  R2_STORAGE_NOT_CONFIGURED: "File storage is temporarily unavailable. Please try again later",
+  UPLOAD_FAILED: "Upload failed. Please check your connection and try again",
+  FILE_ID_REQUIRED: "File not found",
+  LIST_FILES_FAILED: "Unable to load your files. Please refresh the page",
+  INVALID_METADATA: "Invalid file information. Please try uploading again",
+  UPLOAD_ROLLBACK_FAILED: "Upload failed. Please try again",
+  INVALID_FILE_RECORD: "File information is corrupted. Please contact support",
+  DB_OPERATION_FAILED: "Service temporarily unavailable. Please try again later"
+};
+const success = (data) => ({ success: true, data });
+const error = (message, code) => ({
+  success: false,
+  error: message,
+  code
+});
+function validateFileMetadata(record) {
+  if (!record || typeof record !== "object") {
+    return false;
+  }
+  if (typeof record.id !== "string" || typeof record.userId !== "string" || typeof record.filename !== "string" || typeof record.originalName !== "string" || typeof record.contentType !== "string" || typeof record.r2Key !== "string") {
+    return false;
+  }
+  if (typeof record.size !== "number") {
+    return false;
+  }
+  if (record.uploadedAt) {
+    const date = record.uploadedAt instanceof Date ? record.uploadedAt : new Date(record.uploadedAt);
+    if (isNaN(date.getTime())) {
+      return false;
+    }
+    if (!(record.uploadedAt instanceof Date)) {
+      record.uploadedAt = date;
+    }
+  } else {
+    return false;
+  }
+  return true;
+}
+function convertFieldAttributesToZodSchema(additionalFields) {
+  const zodSchema = {};
+  for (const [key, value] of Object.entries(additionalFields)) {
+    let fieldSchema;
+    if (value.type === "string") {
+      fieldSchema = zod.z.string();
+    } else if (value.type === "number") {
+      fieldSchema = zod.z.number();
+    } else if (value.type === "boolean") {
+      fieldSchema = zod.z.boolean();
+    } else if (value.type === "date") {
+      fieldSchema = zod.z.date();
+    } else if (value.type === "string[]") {
+      fieldSchema = zod.z.array(zod.z.string());
+    } else if (value.type === "number[]") {
+      fieldSchema = zod.z.array(zod.z.number());
+    } else {
+      throw new Error(`Unsupported field type: ${value.type} for field ${key}`);
+    }
+    if (!value.required) {
+      fieldSchema = fieldSchema.optional();
+    }
+    zodSchema[key] = fieldSchema;
+  }
+  return zod.z.object(zodSchema);
+}
+const createFileMetadataSchema = (additionalFields) => {
+  if (!additionalFields || Object.keys(additionalFields).length === 0) {
+    return zod.z.record(zod.z.string(), zod.z.any()).optional();
+  }
+  return convertFieldAttributesToZodSchema(additionalFields).optional();
+};
+const fileIdSchema = zod.z.object({
+  fileId: zod.z.string().min(1, "File ID is required")
+});
+const listFilesSchema = zod.z.object({
+  limit: zod.z.number().min(1).max(100).optional(),
+  cursor: zod.z.string().optional()
+  // File ID to start listing from
+}).optional();
+const createUploadFileSchema = (additionalFields) => {
+  const baseShape = {
+    file: zod.z.instanceof(File)
+  };
+  if (!additionalFields || Object.keys(additionalFields).length === 0) {
+    return zod.z.object(baseShape);
+  }
+  for (const [key, value] of Object.entries(additionalFields)) {
+    let fieldSchema;
+    if (value.type === "string") {
+      fieldSchema = zod.z.string();
+    } else if (value.type === "number") {
+      fieldSchema = zod.z.number();
+    } else if (value.type === "boolean") {
+      fieldSchema = zod.z.boolean();
+    } else if (value.type === "date") {
+      fieldSchema = zod.z.date();
+    } else if (value.type === "string[]") {
+      fieldSchema = zod.z.array(zod.z.string());
+    } else if (value.type === "number[]") {
+      fieldSchema = zod.z.array(zod.z.number());
+    } else {
+      throw new Error(`Unsupported field type: ${value.type} for field ${key}`);
+    }
+    if (!value.required) {
+      fieldSchema = fieldSchema.optional();
+    }
+    baseShape[key] = fieldSchema;
+  }
+  return zod.z.object(baseShape);
+};
+const sanitizeFilename = (filename) => {
+  return filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 255);
+};
+const createFileValidator = (config) => {
+  const {
+    maxFileSize = 10485760,
+    // 10MB default
+    allowedTypes
+  } = config;
+  return {
+    validateFile: (file, ctx) => {
+      if (file.size > maxFileSize) {
+        const maxSizeMB = Math.round(maxFileSize / (1024 * 1024));
+        const errorMsg = `${R2_ERROR_CODES.FILE_TOO_LARGE} (max ${maxSizeMB}MB)`;
+        ctx?.logger?.error(`[R2]: File size validation failed:`, errorMsg);
+        return error(errorMsg, "FILE_TOO_LARGE");
+      }
+      if (allowedTypes && allowedTypes.length > 0) {
+        if (!file.name) {
+          const errorMsg = "File must have a name when file type restrictions are enabled";
+          ctx?.logger?.error(`[R2]: File name validation failed:`, errorMsg);
+          return error(errorMsg, "INVALID_FILE_NAME");
+        }
+        const getFileExtension = (filename) => {
+          const lastDotIndex = filename.lastIndexOf(".");
+          return lastDotIndex === -1 ? "" : filename.slice(lastDotIndex + 1).toLowerCase();
+        };
+        const extension = getFileExtension(file.name);
+        if (!extension) {
+          const errorMsg = "File must have an extension when file type restrictions are enabled";
+          ctx?.logger?.error(`[R2]: File extension validation failed:`, errorMsg);
+          return error(errorMsg, "INVALID_FILE_EXTENSION");
+        }
+        const normalizedAllowedTypes = allowedTypes.map(
+          (type) => type.startsWith(".") ? type.slice(1).toLowerCase() : type.toLowerCase()
+        );
+        const isAllowed = normalizedAllowedTypes.includes(extension);
+        if (!isAllowed) {
+          const allowedTypesFormatted = allowedTypes.map((type) => type.startsWith(".") ? type : `.${type}`).join(", ");
+          const errorMsg = `${R2_ERROR_CODES.INVALID_FILE_TYPE}. Supported formats: ${allowedTypesFormatted}`;
+          ctx?.logger?.error(`[R2]: File type validation failed:`, errorMsg);
+          return error(errorMsg, "INVALID_FILE_TYPE");
+        }
+      }
+      return success(true);
+    },
+    validateMetadata: (metadata, ctx) => {
+      const metadataSchema = createFileMetadataSchema(config.additionalFields);
+      const result = metadataSchema.safeParse(metadata);
+      if (!result.success) {
+        const errorMessages = result.error.issues.map((err) => {
+          const path = err.path.length > 0 ? `${err.path.join(".")}: ` : "";
+          return `${path}${err.message}`;
+        }).join(", ");
+        const detailedError = `Invalid metadata: ${errorMessages}`;
+        ctx?.logger?.error(`[R2]: Metadata validation failed:`, {
+          error: detailedError,
+          metadata,
+          zodErrors: result.error.issues
+        });
+        return error(detailedError, "INVALID_METADATA");
+      }
+      return success(result.data);
+    }
+  };
+};
+const createR2Storage = (config, generateId) => {
+  const { bucket } = config;
+  const validator = createFileValidator(config);
+  return {
+    /**
+     * Uploads a file to R2 and returns metadata
+     */
+    async uploadFile(file, originalName, userId, ctx, customMetadata, modelName) {
+      let r2Key = null;
+      try {
+        const fileForValidation = file instanceof File ? file : new File([file], originalName, { type: file.type });
+        const fileValidation = validator.validateFile(fileForValidation, ctx);
+        if (!fileValidation.success) {
+          throw new Error(fileValidation.error);
+        }
+        let validatedMetadata = void 0;
+        if (customMetadata) {
+          const metadataValidation = validator.validateMetadata(customMetadata, ctx);
+          if (!metadataValidation.success) {
+            throw new Error(metadataValidation.error);
+          }
+          validatedMetadata = metadataValidation.data;
+        }
+        const fileId = generateId({ model: modelName || "userFile" });
+        if (!fileId) {
+          throw new Error("Failed to generate unique file ID. Please try again.");
+        }
+        const filename = `${fileId}-${sanitizeFilename(originalName)}`;
+        r2Key = `user-files/${userId}/${filename}`;
+        const metadata = {
+          id: fileId,
+          userId,
+          filename,
+          originalName,
+          contentType: file.type,
+          size: file.size,
+          r2Key,
+          uploadedAt: /* @__PURE__ */ new Date(),
+          ...validatedMetadata
+        };
+        if (config.hooks?.upload?.before) {
+          const result2 = await config.hooks.upload.before(
+            Object.assign(fileForValidation, { userId, r2Key, metadata }),
+            ctx
+          );
+          if (result2 === null) {
+            throw new Error("Upload prevented by beforeUpload hook");
+          }
+        }
+        ctx?.logger?.info(`[R2]: Uploading file for user "${userId}": ${filename}`);
+        const uploadOptions = {
+          httpMetadata: {
+            contentType: file.type
+          },
+          ...validatedMetadata && {
+            customMetadata: Object.fromEntries(
+              Object.entries(validatedMetadata).map(([k, v]) => [
+                k,
+                v === null || v === void 0 ? "" : typeof v === "object" ? JSON.stringify(v) : String(v)
+              ])
+            )
+          }
+        };
+        const result = await bucket.put(r2Key, file, uploadOptions);
+        if (!result) {
+          throw new Error(R2_ERROR_CODES.UPLOAD_FAILED);
+        }
+        ctx?.logger?.info(`[R2]: Successfully uploaded file for user "${userId}": ${filename}`);
+        if (config.hooks?.upload?.after) {
+          await config.hooks.upload.after(metadata, ctx);
+        }
+        return metadata;
+      } catch (error2) {
+        if (r2Key) {
+          try {
+            await bucket.delete(r2Key);
+            ctx?.logger?.info(`[R2]: Cleaned up failed upload: ${r2Key}`);
+          } catch (cleanupError) {
+            ctx?.logger?.error(`[R2]: Failed to cleanup after upload failure:`, cleanupError);
+          }
+        }
+        ctx?.logger?.error(`[R2]: Upload failed for user "${userId}":`, error2);
+        throw error2;
+      }
+    },
+    /**
+     * Downloads a file from R2
+     */
+    async downloadFile(fileMetadata, ctx) {
+      if (config.hooks?.download?.before) {
+        const result = await config.hooks.download.before(fileMetadata, ctx);
+        if (result === null) {
+          throw new Error("Download prevented by beforeDownload hook");
+        }
+      }
+      const object = await bucket.get(fileMetadata.r2Key);
+      const downloadResult = object?.body || null;
+      if (config.hooks?.download?.after) {
+        await config.hooks.download.after(fileMetadata, ctx);
+      }
+      return downloadResult;
+    },
+    /**
+     * Deletes a file from R2
+     */
+    async deleteFile(fileMetadata, ctx) {
+      if (config.hooks?.delete?.before) {
+        const result = await config.hooks.delete.before(fileMetadata, ctx);
+        if (result === null) {
+          throw new Error("Delete prevented by beforeDelete hook");
+        }
+      }
+      await bucket.delete(fileMetadata.r2Key);
+      if (config.hooks?.delete?.after) {
+        await config.hooks.delete.after(fileMetadata, ctx);
+      }
+    },
+    /**
+     * Gets file metadata from R2
+     */
+    async getFileInfo(r2Key) {
+      return await bucket.head(r2Key);
+    },
+    /**
+     * Lists files for a user
+     */
+    async listUserFiles(userId, ctx) {
+      if (config.hooks?.list?.before) {
+        const result = await config.hooks.list.before(userId, ctx);
+        if (result === null) {
+          throw new Error("List prevented by beforeList hook");
+        }
+      }
+      const files = await bucket.list({
+        prefix: `user-files/${userId}/`
+      });
+      if (config.hooks?.list?.after) {
+        await config.hooks.list.after(userId, files, ctx);
+      }
+      return files;
+    }
+  };
+};
+const validateAuthContext = (ctx) => {
+  if (!ctx) {
+    throw new Error("Auth context is not available");
+  }
+  if (!ctx.adapter) {
+    throw new Error("Database adapter is not properly configured");
+  }
+};
+const createR2Endpoints = (getR2Storage, r2Config) => {
+  const allowedMediaTypes = r2Config?.allowedTypes?.map((type) => mime__default.getType(type)).filter((mimeType) => Boolean(mimeType));
+  return {
+    upload: api.createAuthEndpoint(
+      "/files/upload-raw",
+      {
+        method: "POST",
+        metadata: {
+          allowedMediaTypes
+        }
+      },
+      async (ctx) => {
+        const session = await api.getSessionFromCtx(ctx);
+        if (!session) {
+          throw ctx.error("UNAUTHORIZED", { message: "Please sign in to upload files" });
+        }
+        try {
+          validateAuthContext(ctx.context);
+        } catch (error2) {
+          ctx.context.logger?.error("[R2]: Auth context validation failed:", error2);
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.DB_OPERATION_FAILED
+          });
+        }
+        try {
+          ctx.context.logger?.info("[R2]: Starting blob file upload");
+          const r2Storage = getR2Storage();
+          if (!r2Storage) {
+            ctx.context.logger?.error("[R2]: R2 storage not configured");
+            throw ctx.error("INTERNAL_SERVER_ERROR", {
+              message: R2_ERROR_CODES.R2_STORAGE_NOT_CONFIGURED
+            });
+          }
+          const maxFileSize = r2Config?.maxFileSize || 10485760;
+          const contentLength = ctx.request?.headers?.get("content-length");
+          if (contentLength) {
+            const fileSize = parseInt(contentLength, 10);
+            if (fileSize > maxFileSize) {
+              const maxSizeMB = Math.round(maxFileSize / (1024 * 1024));
+              throw new Error(`${R2_ERROR_CODES.FILE_TOO_LARGE} (max ${maxSizeMB}MB)`);
+            }
+          }
+          const rawFilename = ctx.request?.headers?.get("x-filename");
+          const rawMetadataHeader = ctx.request?.headers?.get("x-file-metadata");
+          if (!rawFilename) {
+            throw new Error("x-filename header is required");
+          }
+          const filename = rawFilename.split("").map((char) => {
+            const code = char.charCodeAt(0);
+            return code <= 127 ? char : "?";
+          }).join("");
+          const metadataHeader = rawMetadataHeader ? rawMetadataHeader.split("").map((char) => {
+            const code = char.charCodeAt(0);
+            return code <= 127 ? char : "?";
+          }).join("") : void 0;
+          let additionalFields = {};
+          if (metadataHeader) {
+            try {
+              additionalFields = JSON.parse(metadataHeader);
+            } catch (error2) {
+              ctx.context.logger?.warn("[R2]: Failed to parse metadata header:", error2);
+              throw new Error("Invalid JSON in x-file-metadata header");
+            }
+          }
+          if (r2Config?.additionalFields && Object.keys(additionalFields).length > 0) {
+            const metadataSchema = createFileMetadataSchema(r2Config.additionalFields);
+            const validationResult = metadataSchema.safeParse(additionalFields);
+            if (!validationResult.success) {
+              throw new Error(`Invalid additional fields: ${validationResult.error.message}`);
+            }
+            additionalFields = validationResult.data || {};
+          }
+          const file = ctx.body;
+          if (!file) {
+            throw new Error(R2_ERROR_CODES.NO_FILE_PROVIDED);
+          }
+          let fileToUpload;
+          if (file instanceof File) {
+            fileToUpload = file;
+          } else {
+            fileToUpload = new File([file], filename, {
+              type: file.type || "application/octet-stream"
+            });
+          }
+          const customMetadata = additionalFields || {};
+          const modelName = "userFile";
+          const fileMetadata = await r2Storage.uploadFile(
+            fileToUpload,
+            filename,
+            session.session.userId,
+            ctx.context,
+            customMetadata,
+            modelName
+          );
+          try {
+            await ctx.context.adapter.create({
+              model: modelName,
+              data: {
+                id: fileMetadata.id,
+                userId: fileMetadata.userId,
+                filename: fileMetadata.filename,
+                originalName: fileMetadata.originalName,
+                contentType: fileMetadata.contentType,
+                size: fileMetadata.size,
+                r2Key: fileMetadata.r2Key,
+                uploadedAt: fileMetadata.uploadedAt,
+                ...customMetadata
+              }
+            });
+            ctx.context.logger?.info("[R2]: File metadata saved to database:", fileMetadata.id);
+          } catch (dbError) {
+            ctx.context.logger?.error("[R2]: Failed to save to database:", dbError);
+            try {
+              await r2Storage.deleteFile(fileMetadata, ctx.context);
+            } catch (cleanupError) {
+              ctx.context.logger?.error("[R2]: Failed to cleanup R2 file after DB error:", cleanupError);
+            }
+            throw ctx.error("INTERNAL_SERVER_ERROR", {
+              message: R2_ERROR_CODES.DB_OPERATION_FAILED
+            });
+          }
+          return ctx.json({
+            success: true,
+            data: fileMetadata
+          });
+        } catch (error2) {
+          ctx.context.logger?.error("[R2]: Upload failed:", error2);
+          if (error2 instanceof Error) {
+            throw ctx.error("INTERNAL_SERVER_ERROR", {
+              message: error2.message
+            });
+          }
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.UPLOAD_FAILED
+          });
+        }
+      }
+    ),
+    download: api.createAuthEndpoint(
+      "/files/download",
+      {
+        method: "POST",
+        use: [api.sessionMiddleware],
+        body: fileIdSchema
+      },
+      async (ctx) => {
+        const session = ctx.context.session;
+        const r2Storage = getR2Storage();
+        if (!r2Storage) {
+          ctx.context.logger?.error("[R2]: R2 storage not configured");
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.R2_STORAGE_NOT_CONFIGURED
+          });
+        }
+        const { fileId } = ctx.body;
+        const fileRecord = await ctx.context.adapter.findOne({
+          model: "userFile",
+          where: [
+            { field: "id", value: fileId },
+            { field: "userId", value: session.session.userId }
+          ]
+        });
+        if (!fileRecord) {
+          ctx.context.logger?.warn(
+            `[R2]: File not found or access denied for user "${session.session.userId}": ${fileId}`
+          );
+          throw ctx.error("NOT_FOUND", {
+            message: "File not found. It may have been deleted or you don't have permission to access it"
+          });
+        }
+        if (!validateFileMetadata(fileRecord)) {
+          ctx.context.logger?.error(`[R2]: Invalid file record structure for file: ${fileId}`);
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.INVALID_FILE_RECORD
+          });
+        }
+        const fileData = await r2Storage.downloadFile(fileRecord, ctx.context);
+        if (!fileData) {
+          ctx.context.logger?.error(`[R2]: File data not found in R2 for file: ${fileId}`);
+          throw ctx.error("NOT_FOUND", {
+            message: "File content is temporarily unavailable. Please try again later"
+          });
+        }
+        ctx.context.logger?.info(
+          `[R2]: File downloaded successfully for user "${session.session.userId}": ${fileId}`
+        );
+        return new Response(fileData, {
+          headers: {
+            "Content-Type": fileRecord.contentType || "application/octet-stream",
+            "Content-Disposition": `attachment; filename="${fileRecord.originalName}"`,
+            "Content-Length": fileRecord.size?.toString() || "0"
+          }
+        });
+      }
+    ),
+    delete: api.createAuthEndpoint(
+      "/files/delete",
+      {
+        method: "POST",
+        use: [api.sessionMiddleware],
+        body: fileIdSchema
+      },
+      async (ctx) => {
+        const session = ctx.context.session;
+        const r2Storage = getR2Storage();
+        if (!r2Storage) {
+          ctx.context.logger?.error("[R2]: R2 storage not configured");
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.R2_STORAGE_NOT_CONFIGURED
+          });
+        }
+        const { fileId } = ctx.body;
+        const fileRecord = await ctx.context.adapter.findOne({
+          model: "userFile",
+          where: [
+            { field: "id", value: fileId },
+            { field: "userId", value: session.session.userId }
+          ]
+        });
+        if (!fileRecord) {
+          ctx.context.logger?.warn(
+            `[R2]: File not found or access denied for user "${session.session.userId}": ${fileId}`
+          );
+          throw ctx.error("NOT_FOUND", {
+            message: "File not found. It may have been deleted or you don't have permission to delete it"
+          });
+        }
+        if (!validateFileMetadata(fileRecord)) {
+          ctx.context.logger?.error(`[R2]: Invalid file record structure for file: ${fileId}`);
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.INVALID_FILE_RECORD
+          });
+        }
+        await r2Storage.deleteFile(fileRecord, ctx.context);
+        await ctx.context.adapter.delete({
+          model: "userFile",
+          where: [{ field: "id", value: fileId }]
+        });
+        ctx.context.logger?.info(
+          `[R2]: File deleted successfully for user "${session.session.userId}": ${fileId}`
+        );
+        return ctx.json({
+          message: "File deleted successfully",
+          fileId
+        });
+      }
+    ),
+    list: api.createAuthEndpoint(
+      "/files/list",
+      {
+        method: "GET",
+        use: [api.sessionMiddleware]
+      },
+      async (ctx) => {
+        const session = ctx.context.session;
+        try {
+          validateAuthContext(ctx.context);
+        } catch (error2) {
+          ctx.context.logger?.error("[R2]: Auth context validation failed:", error2);
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.DB_OPERATION_FAILED
+          });
+        }
+        const r2Storage = getR2Storage();
+        if (!r2Storage) {
+          ctx.context.logger?.error("[R2]: R2 storage not configured");
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.R2_STORAGE_NOT_CONFIGURED
+          });
+        }
+        const limit = ctx.query?.limit ? parseInt(ctx.query.limit) : 50;
+        const cursor = ctx.query?.cursor;
+        try {
+          const modelName = "userFile";
+          ctx.context.logger?.info(`[R2]: Using model name "${modelName}" for listing files`);
+          let fileRecords = [];
+          const actualLimit = Math.min(limit, 100) + 1;
+          try {
+            const whereConditions = [{ field: "userId", value: session.session.userId }];
+            fileRecords = await ctx.context.adapter.findMany({
+              model: modelName,
+              where: whereConditions,
+              limit: actualLimit,
+              sortBy: { field: "uploadedAt", direction: "desc" }
+              // Most recent first
+            });
+            if (cursor) {
+              const cursorIndex = fileRecords.findIndex((file) => file.id === cursor);
+              if (cursorIndex !== -1) {
+                fileRecords = fileRecords.slice(cursorIndex + 1);
+              }
+            }
+          } catch (dbError) {
+            ctx.context.logger?.error(`[R2]: Database query failed for model "${modelName}":`, dbError);
+            if (dbError instanceof Error) {
+              ctx.context.logger?.error(`[R2]: Error message: ${dbError.message}`);
+              ctx.context.logger?.error(`[R2]: Error stack: ${dbError.stack}`);
+            }
+            throw dbError;
+          }
+          const validFileRecords = fileRecords.filter((record) => validateFileMetadata(record));
+          const hasMore = validFileRecords.length > limit;
+          const files = hasMore ? validFileRecords.slice(0, -1) : validFileRecords;
+          const nextCursor = hasMore ? files[files.length - 1].id : null;
+          ctx.context.logger?.info(
+            `[R2]: Listed ${files.length} files for user "${session.session.userId}" (hasMore: ${hasMore})`
+          );
+          return ctx.json({
+            files,
+            nextCursor,
+            hasMore
+          });
+        } catch (error2) {
+          ctx.context.logger?.error("[R2]: Failed to list files:", error2);
+          throw ctx.error("INTERNAL_SERVER_ERROR", {
+            message: R2_ERROR_CODES.LIST_FILES_FAILED
+          });
+        }
+      }
+    ),
+    get: api.createAuthEndpoint(
+      "/files/get",
+      {
+        method: "POST",
+        use: [api.sessionMiddleware],
+        body: fileIdSchema
+      },
+      async (ctx) => {
+        const session = ctx.context.session;
+        const { fileId } = ctx.body;
+        const fileRecord = await ctx.context.adapter.findOne({
+          model: "userFile",
+          where: [
+            { field: "id", value: fileId },
+            { field: "userId", value: session.session.userId }
+          ]
+        });
+        if (!fileRecord) {
+          ctx.context.logger?.warn(
+            `[R2]: File not found or access denied for user "${session.session.userId}": ${fileId}`
+          );
+          throw ctx.error("NOT_FOUND", {
+            message: "File not found. It may have been deleted or you don't have permission to access it"
+          });
+        }
+        return ctx.json({ data: fileRecord });
+      }
+    )
+  };
+};
+
+exports.R2_ERROR_CODES = R2_ERROR_CODES;
+exports.createFileMetadataSchema = createFileMetadataSchema;
+exports.createFileValidator = createFileValidator;
+exports.createR2Endpoints = createR2Endpoints;
+exports.createR2Storage = createR2Storage;
+exports.createUploadFileSchema = createUploadFileSchema;
+exports.error = error;
+exports.fileIdSchema = fileIdSchema;
+exports.listFilesSchema = listFilesSchema;
+exports.success = success;

@@ -1,0 +1,399 @@
+import * as better_auth from 'better-auth';
+import { AuthContext } from 'better-auth';
+import { FieldAttribute } from 'better-auth/db';
+import { z } from 'zod';
+import { R2Config, FileMetadata } from './types.mjs';
+import '@cloudflare/workers-types';
+import 'better-auth/adapters/drizzle';
+import 'drizzle-orm/d1';
+import 'drizzle-orm/mysql2';
+import 'drizzle-orm/postgres-js';
+
+declare const R2_ERROR_CODES: {
+    readonly FILE_TOO_LARGE: "File is too large. Please choose a smaller file";
+    readonly INVALID_FILE_TYPE: "File type not supported. Please choose a different file";
+    readonly NO_FILE_PROVIDED: "Please select a file to upload";
+    readonly INVALID_REQUEST: "Invalid request. Please try again";
+    readonly R2_STORAGE_NOT_CONFIGURED: "File storage is temporarily unavailable. Please try again later";
+    readonly UPLOAD_FAILED: "Upload failed. Please check your connection and try again";
+    readonly FILE_ID_REQUIRED: "File not found";
+    readonly LIST_FILES_FAILED: "Unable to load your files. Please refresh the page";
+    readonly INVALID_METADATA: "Invalid file information. Please try uploading again";
+    readonly UPLOAD_ROLLBACK_FAILED: "Upload failed. Please try again";
+    readonly INVALID_FILE_RECORD: "File information is corrupted. Please contact support";
+    readonly DB_OPERATION_FAILED: "Service temporarily unavailable. Please try again later";
+};
+/**
+ * Result type for validation operations
+ */
+type ValidationResult<T> = {
+    success: true;
+    data: T;
+} | {
+    success: false;
+    error: string;
+    code?: string;
+};
+/**
+ * Helper to create success result
+ */
+declare const success: <T>(data: T) => ValidationResult<T>;
+/**
+ * Helper to create error result
+ */
+declare const error: (message: string, code?: string) => ValidationResult<never>;
+declare const createFileMetadataSchema: (additionalFields?: Record<string, FieldAttribute>) => z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>> | z.ZodOptional<z.ZodObject<{
+    [x: string]: z.ZodType<unknown, unknown, z.core.$ZodTypeInternals<unknown, unknown>>;
+}, z.core.$strip>>;
+declare const fileIdSchema: z.ZodObject<{
+    fileId: z.ZodString;
+}, z.core.$strip>;
+declare const listFilesSchema: z.ZodOptional<z.ZodObject<{
+    limit: z.ZodOptional<z.ZodNumber>;
+    cursor: z.ZodOptional<z.ZodString>;
+}, z.core.$strip>>;
+/**
+ * Creates upload schema dynamically based on additionalFields configuration
+ */
+declare const createUploadFileSchema: (additionalFields?: Record<string, FieldAttribute>) => z.ZodObject<{
+    [x: string]: z.ZodType<unknown, unknown, z.core.$ZodTypeInternals<unknown, unknown>>;
+}, z.core.$strip>;
+/**
+ * Validates file constraints using Result pattern
+ */
+declare const createFileValidator: (config: R2Config) => {
+    validateFile: (file: File, ctx?: AuthContext) => ValidationResult<true>;
+    validateMetadata: (metadata: Record<string, any>, ctx?: AuthContext) => ValidationResult<Record<string, any> | undefined>;
+};
+/**
+ * Creates R2 storage utilities with Better Auth context for error handling and logging
+ */
+declare const createR2Storage: (config: R2Config, generateId: (options: {
+    model: string;
+    size?: number;
+}) => string | false) => {
+    /**
+     * Uploads a file to R2 and returns metadata
+     */
+    uploadFile(file: File | Blob, originalName: string, userId: string, ctx: AuthContext, customMetadata?: Record<string, any>, modelName?: string): Promise<FileMetadata>;
+    /**
+     * Downloads a file from R2
+     */
+    downloadFile(fileMetadata: FileMetadata, ctx: AuthContext): Promise<ReadableStream | null>;
+    /**
+     * Deletes a file from R2
+     */
+    deleteFile(fileMetadata: FileMetadata, ctx: AuthContext): Promise<void>;
+    /**
+     * Gets file metadata from R2
+     */
+    getFileInfo(r2Key: string): Promise<any>;
+    /**
+     * Lists files for a user
+     */
+    listUserFiles(userId: string, ctx: AuthContext): Promise<{
+        objects: any[];
+    }>;
+};
+/**
+ * Creates R2 endpoints for Better Auth plugin
+ */
+declare const createR2Endpoints: (getR2Storage: () => ReturnType<typeof createR2Storage> | null, r2Config?: R2Config) => {
+    upload: {
+        <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0?: ({
+            body?: undefined;
+        } & {
+            method?: "POST" | undefined;
+        } & {
+            query?: Record<string, any> | undefined;
+        } & {
+            params?: Record<string, any>;
+        } & {
+            request?: Request;
+        } & {
+            headers?: HeadersInit;
+        } & {
+            asResponse?: boolean;
+            returnHeaders?: boolean;
+            use?: better_auth.Middleware[];
+            path?: string;
+        } & {
+            asResponse?: AsResponse | undefined;
+            returnHeaders?: ReturnHeaders | undefined;
+        }) | undefined): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+            headers: Headers;
+            response: {
+                success: boolean;
+                data: FileMetadata;
+            };
+        } : {
+            success: boolean;
+            data: FileMetadata;
+        }>;
+        options: {
+            method: "POST";
+            metadata: {
+                allowedMediaTypes: string[] | undefined;
+            };
+        } & {
+            use: any[];
+        };
+        path: "/files/upload-raw";
+    };
+    download: {
+        <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0: {
+            body: {
+                fileId: string;
+            };
+        } & {
+            method?: "POST" | undefined;
+        } & {
+            query?: Record<string, any> | undefined;
+        } & {
+            params?: Record<string, any>;
+        } & {
+            request?: Request;
+        } & {
+            headers?: HeadersInit;
+        } & {
+            asResponse?: boolean;
+            returnHeaders?: boolean;
+            use?: better_auth.Middleware[];
+            path?: string;
+        } & {
+            asResponse?: AsResponse | undefined;
+            returnHeaders?: ReturnHeaders | undefined;
+        }): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+            headers: Headers;
+            response: Response;
+        } : Response>;
+        options: {
+            method: "POST";
+            use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                session: {
+                    session: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        userId: string;
+                        expiresAt: Date;
+                        token: string;
+                        ipAddress?: string | null | undefined;
+                        userAgent?: string | null | undefined;
+                    };
+                    user: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        email: string;
+                        emailVerified: boolean;
+                        name: string;
+                        image?: string | null | undefined;
+                    };
+                };
+            }>)[];
+            body: z.ZodObject<{
+                fileId: z.ZodString;
+            }, z.core.$strip>;
+        } & {
+            use: any[];
+        };
+        path: "/files/download";
+    };
+    delete: {
+        <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0: {
+            body: {
+                fileId: string;
+            };
+        } & {
+            method?: "POST" | undefined;
+        } & {
+            query?: Record<string, any> | undefined;
+        } & {
+            params?: Record<string, any>;
+        } & {
+            request?: Request;
+        } & {
+            headers?: HeadersInit;
+        } & {
+            asResponse?: boolean;
+            returnHeaders?: boolean;
+            use?: better_auth.Middleware[];
+            path?: string;
+        } & {
+            asResponse?: AsResponse | undefined;
+            returnHeaders?: ReturnHeaders | undefined;
+        }): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+            headers: Headers;
+            response: {
+                message: string;
+                fileId: string;
+            };
+        } : {
+            message: string;
+            fileId: string;
+        }>;
+        options: {
+            method: "POST";
+            use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                session: {
+                    session: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        userId: string;
+                        expiresAt: Date;
+                        token: string;
+                        ipAddress?: string | null | undefined;
+                        userAgent?: string | null | undefined;
+                    };
+                    user: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        email: string;
+                        emailVerified: boolean;
+                        name: string;
+                        image?: string | null | undefined;
+                    };
+                };
+            }>)[];
+            body: z.ZodObject<{
+                fileId: z.ZodString;
+            }, z.core.$strip>;
+        } & {
+            use: any[];
+        };
+        path: "/files/delete";
+    };
+    list: {
+        <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0?: ({
+            body?: undefined;
+        } & {
+            method?: "GET" | undefined;
+        } & {
+            query?: Record<string, any> | undefined;
+        } & {
+            params?: Record<string, any>;
+        } & {
+            request?: Request;
+        } & {
+            headers?: HeadersInit;
+        } & {
+            asResponse?: boolean;
+            returnHeaders?: boolean;
+            use?: better_auth.Middleware[];
+            path?: string;
+        } & {
+            asResponse?: AsResponse | undefined;
+            returnHeaders?: ReturnHeaders | undefined;
+        }) | undefined): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+            headers: Headers;
+            response: {
+                files: FileMetadata[];
+                nextCursor: string | null;
+                hasMore: boolean;
+            };
+        } : {
+            files: FileMetadata[];
+            nextCursor: string | null;
+            hasMore: boolean;
+        }>;
+        options: {
+            method: "GET";
+            use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                session: {
+                    session: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        userId: string;
+                        expiresAt: Date;
+                        token: string;
+                        ipAddress?: string | null | undefined;
+                        userAgent?: string | null | undefined;
+                    };
+                    user: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        email: string;
+                        emailVerified: boolean;
+                        name: string;
+                        image?: string | null | undefined;
+                    };
+                };
+            }>)[];
+        } & {
+            use: any[];
+        };
+        path: "/files/list";
+    };
+    get: {
+        <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0: {
+            body: {
+                fileId: string;
+            };
+        } & {
+            method?: "POST" | undefined;
+        } & {
+            query?: Record<string, any> | undefined;
+        } & {
+            params?: Record<string, any>;
+        } & {
+            request?: Request;
+        } & {
+            headers?: HeadersInit;
+        } & {
+            asResponse?: boolean;
+            returnHeaders?: boolean;
+            use?: better_auth.Middleware[];
+            path?: string;
+        } & {
+            asResponse?: AsResponse | undefined;
+            returnHeaders?: ReturnHeaders | undefined;
+        }): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+            headers: Headers;
+            response: {
+                data: {};
+            };
+        } : {
+            data: {};
+        }>;
+        options: {
+            method: "POST";
+            use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                session: {
+                    session: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        userId: string;
+                        expiresAt: Date;
+                        token: string;
+                        ipAddress?: string | null | undefined;
+                        userAgent?: string | null | undefined;
+                    };
+                    user: Record<string, any> & {
+                        id: string;
+                        createdAt: Date;
+                        updatedAt: Date;
+                        email: string;
+                        emailVerified: boolean;
+                        name: string;
+                        image?: string | null | undefined;
+                    };
+                };
+            }>)[];
+            body: z.ZodObject<{
+                fileId: z.ZodString;
+            }, z.core.$strip>;
+        } & {
+            use: any[];
+        };
+        path: "/files/get";
+    };
+};
+
+export { R2_ERROR_CODES, createFileMetadataSchema, createFileValidator, createR2Endpoints, createR2Storage, createUploadFileSchema, error, fileIdSchema, listFilesSchema, success };
+export type { ValidationResult };

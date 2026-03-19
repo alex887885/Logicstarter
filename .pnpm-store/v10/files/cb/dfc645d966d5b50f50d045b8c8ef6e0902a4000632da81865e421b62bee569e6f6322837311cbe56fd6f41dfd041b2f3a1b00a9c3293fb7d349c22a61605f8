@@ -1,0 +1,36 @@
+'use strict';
+
+function sanitizeHeaderValue(value) {
+  return value.split("").map((char) => {
+    const code = char.charCodeAt(0);
+    return code <= 127 ? char : "?";
+  }).join("");
+}
+const cloudflareClient = () => {
+  return {
+    id: "cloudflare",
+    $InferServerPlugin: {},
+    getActions: ($fetch) => {
+      return {
+        /**
+         * Upload a file by sending it directly as the request body with metadata in headers.
+         */
+        uploadFile: async (file, metadata) => {
+          const headers = {
+            "x-filename": sanitizeHeaderValue(file.name)
+          };
+          if (metadata && Object.keys(metadata).length > 0) {
+            headers["x-file-metadata"] = sanitizeHeaderValue(JSON.stringify(metadata));
+          }
+          return $fetch("/files/upload-raw", {
+            method: "POST",
+            headers,
+            body: file
+          });
+        }
+      };
+    }
+  };
+};
+
+exports.cloudflareClient = cloudflareClient;

@@ -1,0 +1,420 @@
+import * as zod from 'zod';
+import { CloudflarePluginOptions, FileMetadata, CloudflareGeolocation, WithCloudflareOptions } from './types.mjs';
+import * as better_auth from 'better-auth';
+import { BetterAuthOptions, Session } from 'better-auth';
+import * as better_auth_db from 'better-auth/db';
+import { SecondaryStorage } from 'better-auth/db';
+import { KVNamespace } from '@cloudflare/workers-types';
+import * as better_auth_client from 'better-auth/client';
+import './schema.mjs';
+import './r2.mjs';
+import 'better-auth/adapters/drizzle';
+import 'drizzle-orm/d1';
+import 'drizzle-orm/mysql2';
+import 'drizzle-orm/postgres-js';
+
+/**
+ * Cloudflare client plugin for Better Auth
+ */
+declare const cloudflareClient: () => {
+    id: "cloudflare";
+    $InferServerPlugin: ReturnType<typeof cloudflare>;
+    getActions: ($fetch: better_auth_client.BetterFetch) => {
+        /**
+         * Upload a file by sending it directly as the request body with metadata in headers.
+         */
+        uploadFile: (file: File, metadata?: Record<string, any>) => Promise<{
+            data: unknown;
+            error: null;
+        } | {
+            data: null;
+            error: {
+                message?: string | undefined;
+                status: number;
+                statusText: string;
+            };
+        }>;
+    };
+};
+
+/**
+ * Cloudflare integration for Better Auth
+ *
+ * @param options - Plugin configuration options
+ * @returns Better Auth plugin for Cloudflare
+ */
+declare const cloudflare: (options?: CloudflarePluginOptions) => {
+    id: "cloudflare";
+    schema: better_auth_db.BetterAuthPluginDBSchema;
+    endpoints: {
+        upload?: {
+            <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0?: ({
+                body?: undefined;
+            } & {
+                method?: "POST" | undefined;
+            } & {
+                query?: Record<string, any> | undefined;
+            } & {
+                params?: Record<string, any>;
+            } & {
+                request?: Request;
+            } & {
+                headers?: HeadersInit;
+            } & {
+                asResponse?: boolean;
+                returnHeaders?: boolean;
+                use?: better_auth.Middleware[];
+                path?: string;
+            } & {
+                asResponse?: AsResponse | undefined;
+                returnHeaders?: ReturnHeaders | undefined;
+            }) | undefined): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+                headers: Headers;
+                response: {
+                    success: boolean;
+                    data: FileMetadata;
+                };
+            } : {
+                success: boolean;
+                data: FileMetadata;
+            }>;
+            options: {
+                method: "POST";
+                metadata: {
+                    allowedMediaTypes: string[] | undefined;
+                };
+            } & {
+                use: any[];
+            };
+            path: "/files/upload-raw";
+        } | undefined;
+        download?: {
+            <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0: {
+                body: {
+                    fileId: string;
+                };
+            } & {
+                method?: "POST" | undefined;
+            } & {
+                query?: Record<string, any> | undefined;
+            } & {
+                params?: Record<string, any>;
+            } & {
+                request?: Request;
+            } & {
+                headers?: HeadersInit;
+            } & {
+                asResponse?: boolean;
+                returnHeaders?: boolean;
+                use?: better_auth.Middleware[];
+                path?: string;
+            } & {
+                asResponse?: AsResponse | undefined;
+                returnHeaders?: ReturnHeaders | undefined;
+            }): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+                headers: Headers;
+                response: Response;
+            } : Response>;
+            options: {
+                method: "POST";
+                use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                    session: {
+                        session: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            userId: string;
+                            expiresAt: Date;
+                            token: string;
+                            ipAddress?: string | null | undefined;
+                            userAgent?: string | null | undefined;
+                        };
+                        user: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            email: string;
+                            emailVerified: boolean;
+                            name: string;
+                            image?: string | null | undefined;
+                        };
+                    };
+                }>)[];
+                body: zod.ZodObject<{
+                    fileId: zod.ZodString;
+                }, better_auth.$strip>;
+            } & {
+                use: any[];
+            };
+            path: "/files/download";
+        } | undefined;
+        delete?: {
+            <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0: {
+                body: {
+                    fileId: string;
+                };
+            } & {
+                method?: "POST" | undefined;
+            } & {
+                query?: Record<string, any> | undefined;
+            } & {
+                params?: Record<string, any>;
+            } & {
+                request?: Request;
+            } & {
+                headers?: HeadersInit;
+            } & {
+                asResponse?: boolean;
+                returnHeaders?: boolean;
+                use?: better_auth.Middleware[];
+                path?: string;
+            } & {
+                asResponse?: AsResponse | undefined;
+                returnHeaders?: ReturnHeaders | undefined;
+            }): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+                headers: Headers;
+                response: {
+                    message: string;
+                    fileId: string;
+                };
+            } : {
+                message: string;
+                fileId: string;
+            }>;
+            options: {
+                method: "POST";
+                use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                    session: {
+                        session: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            userId: string;
+                            expiresAt: Date;
+                            token: string;
+                            ipAddress?: string | null | undefined;
+                            userAgent?: string | null | undefined;
+                        };
+                        user: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            email: string;
+                            emailVerified: boolean;
+                            name: string;
+                            image?: string | null | undefined;
+                        };
+                    };
+                }>)[];
+                body: zod.ZodObject<{
+                    fileId: zod.ZodString;
+                }, better_auth.$strip>;
+            } & {
+                use: any[];
+            };
+            path: "/files/delete";
+        } | undefined;
+        list?: {
+            <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0?: ({
+                body?: undefined;
+            } & {
+                method?: "GET" | undefined;
+            } & {
+                query?: Record<string, any> | undefined;
+            } & {
+                params?: Record<string, any>;
+            } & {
+                request?: Request;
+            } & {
+                headers?: HeadersInit;
+            } & {
+                asResponse?: boolean;
+                returnHeaders?: boolean;
+                use?: better_auth.Middleware[];
+                path?: string;
+            } & {
+                asResponse?: AsResponse | undefined;
+                returnHeaders?: ReturnHeaders | undefined;
+            }) | undefined): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+                headers: Headers;
+                response: {
+                    files: FileMetadata[];
+                    nextCursor: string | null;
+                    hasMore: boolean;
+                };
+            } : {
+                files: FileMetadata[];
+                nextCursor: string | null;
+                hasMore: boolean;
+            }>;
+            options: {
+                method: "GET";
+                use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                    session: {
+                        session: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            userId: string;
+                            expiresAt: Date;
+                            token: string;
+                            ipAddress?: string | null | undefined;
+                            userAgent?: string | null | undefined;
+                        };
+                        user: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            email: string;
+                            emailVerified: boolean;
+                            name: string;
+                            image?: string | null | undefined;
+                        };
+                    };
+                }>)[];
+            } & {
+                use: any[];
+            };
+            path: "/files/list";
+        } | undefined;
+        get?: {
+            <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0: {
+                body: {
+                    fileId: string;
+                };
+            } & {
+                method?: "POST" | undefined;
+            } & {
+                query?: Record<string, any> | undefined;
+            } & {
+                params?: Record<string, any>;
+            } & {
+                request?: Request;
+            } & {
+                headers?: HeadersInit;
+            } & {
+                asResponse?: boolean;
+                returnHeaders?: boolean;
+                use?: better_auth.Middleware[];
+                path?: string;
+            } & {
+                asResponse?: AsResponse | undefined;
+                returnHeaders?: ReturnHeaders | undefined;
+            }): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+                headers: Headers;
+                response: {
+                    data: {};
+                };
+            } : {
+                data: {};
+            }>;
+            options: {
+                method: "POST";
+                use: ((inputContext: better_auth.MiddlewareInputContext<better_auth.MiddlewareOptions>) => Promise<{
+                    session: {
+                        session: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            userId: string;
+                            expiresAt: Date;
+                            token: string;
+                            ipAddress?: string | null | undefined;
+                            userAgent?: string | null | undefined;
+                        };
+                        user: Record<string, any> & {
+                            id: string;
+                            createdAt: Date;
+                            updatedAt: Date;
+                            email: string;
+                            emailVerified: boolean;
+                            name: string;
+                            image?: string | null | undefined;
+                        };
+                    };
+                }>)[];
+                body: zod.ZodObject<{
+                    fileId: zod.ZodString;
+                }, better_auth.$strip>;
+            } & {
+                use: any[];
+            };
+            path: "/files/get";
+        } | undefined;
+        getGeolocation: {
+            <AsResponse extends boolean = false, ReturnHeaders extends boolean = false>(inputCtx_0?: ({
+                body?: undefined;
+            } & {
+                method?: "GET" | undefined;
+            } & {
+                query?: Record<string, any> | undefined;
+            } & {
+                params?: Record<string, any>;
+            } & {
+                request?: Request;
+            } & {
+                headers?: HeadersInit;
+            } & {
+                asResponse?: boolean;
+                returnHeaders?: boolean;
+                use?: better_auth.Middleware[];
+                path?: string;
+            } & {
+                asResponse?: AsResponse | undefined;
+                returnHeaders?: ReturnHeaders | undefined;
+            }) | undefined): Promise<[AsResponse] extends [true] ? Response : [ReturnHeaders] extends [true] ? {
+                headers: Headers;
+                response: CloudflareGeolocation | {
+                    error: string;
+                };
+            } : CloudflareGeolocation | {
+                error: string;
+            }>;
+            options: {
+                method: "GET";
+            } & {
+                use: any[];
+            };
+            path: "/cloudflare/geolocation";
+        };
+    };
+    init(init_ctx: better_auth.AuthContext): {
+        options: {
+            databaseHooks: {
+                session: {
+                    create: {
+                        before: (s: any) => Promise<any>;
+                    };
+                };
+            };
+        };
+    };
+};
+/**
+ * Creates secondary storage using Cloudflare KV
+ *
+ * @param kv - Cloudflare KV namespace
+ * @returns SecondaryStorage implementation
+ */
+declare const createKVStorage: (kv: KVNamespace<string>) => SecondaryStorage;
+/**
+ * Type helper to infer the enhanced auth type with Cloudflare plugin
+ */
+type WithCloudflareAuth<T extends BetterAuthOptions> = T & {
+    plugins: [ReturnType<typeof cloudflare>, ...(T["plugins"] extends readonly any[] ? T["plugins"] : [])];
+};
+/**
+ * Enhances BetterAuthOptions with Cloudflare-specific configurations.
+ *
+ * This function integrates Cloudflare services like D1 for database and KV for secondary storage,
+ * and sets up IP address detection and geolocation tracking based on the provided Cloudflare options.
+ *
+ * @param cloudFlareOptions - Options for configuring Cloudflare integration.
+ * @param options - The base BetterAuthOptions to be enhanced.
+ * @returns BetterAuthOptions configured for use with Cloudflare.
+ */
+declare const withCloudflare: <T extends BetterAuthOptions>(cloudFlareOptions: WithCloudflareOptions, options: T) => WithCloudflareAuth<T>;
+type SessionWithGeolocation = Session & CloudflareGeolocation;
+
+export { createKVStorage as a, cloudflare as c, cloudflareClient, withCloudflare as w };
+export type { SessionWithGeolocation as S };
